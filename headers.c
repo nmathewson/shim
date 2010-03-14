@@ -100,12 +100,19 @@ headers_find(struct header_list *headers, const char *key)
 		TAILQ_FOREACH(line, &h->val, next)
 			len += line->len;
 
+		/* XXX Some of this space is wasted if we trim any leading WS
+ 		   from value lines */
 		ret = mem_calloc(1, len + 1);
 		p = ret;
 
 		TAILQ_FOREACH(line, &h->val, next) {
-			memcpy(p, line->str, line->len);
-			p += line->len;
+			len = strspn(line->str, " \t");
+			/* after the first line, translate leading WS to
+ 		 	   a single SP */
+			if (p != ret)
+				*p++ = ' ';
+			memcpy(p, line->str + len, line->len - len);
+			p += line->len - len;
 		}
 	
 		return ret;	
