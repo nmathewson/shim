@@ -123,6 +123,19 @@ free_token_list(struct token_list *tokens)
 	}
 }
 
+ev_int64_t
+parse_int(const char *buf, int base)
+{
+	char *endp;
+	ev_int64_t rv;
+
+	rv = evutil_strtoll(buf, &endp, base);
+	// XXX
+	//
+	
+	return rv;
+}
+
 #ifdef TEST_UTIL
 #include <stdio.h>
 #include <stdlib.h>
