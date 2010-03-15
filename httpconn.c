@@ -641,6 +641,18 @@ http_conn_has_body(struct http_conn *conn)
 	return conn->has_body;
 }
 
+void
+http_conn_stop_reading(struct http_conn *conn)
+{
+	bufferevent_disable(conn->bev, EV_READ);
+}
+
+void
+http_conn_start_reading(struct http_conn *conn)
+{
+	bufferevent_enable(conn->bev, EV_READ);
+}
+
 #ifdef TEST_HTTP
 #include <netinet/in.h>
 #include <stdio.h>

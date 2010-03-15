@@ -92,4 +92,8 @@ int http_conn_write_buf(struct http_conn *conn, struct evbuffer *buf);
 
 int http_conn_has_body(struct http_conn *conn);
 
+/* turn read off/on; useful for when the other end is choking */
+void http_conn_stop_reading(struct http_conn *conn);
+void http_conn_start_reading(struct http_conn *conn);
+
 #endif
