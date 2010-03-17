@@ -8,11 +8,12 @@ enum http_version {
 };
 
 enum http_state {
-	STATE_IDLE,
-	STATE_READ_FIRSTLINE,
-	STATE_READ_HEADERS,
-	STATE_READ_BODY,
-	STATE_MANGLED
+	HTTP_STATE_IDLE,
+	HTTP_STATE_CONNECTING,
+	HTTP_STATE_READ_FIRSTLINE,
+	HTTP_STATE_READ_HEADERS,
+	HTTP_STATE_READ_BODY,
+	HTTP_STATE_MANGLED
 };
 
 enum http_type {
@@ -35,6 +36,7 @@ enum http_te {
 
 enum http_conn_error {
 	ERROR_NONE,
+	ERROR_CONNECT_FAILED,
 	ERROR_IDLE_CONN_TIMEDOUT,
 	ERROR_CLIENT_POST_WITHOUT_LENGTH,
 	ERROR_INCOMPLETE_HEADERS,
@@ -46,13 +48,15 @@ enum http_conn_error {
 
 struct evbuffer;
 struct event_base;
+struct evdns_base;
 struct http_conn;
-struct headers;
+struct header_list;
+struct url;
 
 struct http_request {
 	TAILQ_ENTRY(http_request) next;
 	enum http_method meth;
-	char *uri;
+	struct url *url;
 	enum http_version vers;
 	struct header_list *headers;
 };
@@ -66,6 +70,7 @@ struct http_response {
 };
 
 struct http_cbs {
+	void (*on_connect)(struct http_conn *, void *);
 	void (*on_error)(struct http_conn *, enum http_conn_error, void *);
 	void (*on_client_request)(struct http_conn *, struct http_request *, void *);
 	void (*on_server_response)(struct http_conn *, struct http_response *, void *);
@@ -77,23 +82,28 @@ struct http_cbs {
 };
 
 struct http_conn *http_conn_new(struct event_base *base, evutil_socket_t sock,
-				enum http_type type, struct http_cbs *cbs,
+				enum http_type type, const struct http_cbs *cbs,
 				void *cbarg);
+
+int http_conn_connect(struct http_conn *conn, struct evdns_base *dns,
+		      int family, const char *host, int port);
 
 void http_conn_free(struct http_conn *conn);
 
-void http_conn_add_request(struct http_conn *conn, struct http_request *req);
-void http_conn_del_request(struct http_conn *conn, struct http_request *req);
-
+void http_conn_write_request(struct http_conn *conn, struct http_request *req);
 void http_conn_write_response(struct http_conn *conn, struct http_response *resp);
 
 /* return: -1 on failure, 0 on choaked, 1 on queued. */
 int http_conn_write_buf(struct http_conn *conn, struct evbuffer *buf);
 
-int http_conn_has_body(struct http_conn *conn);
+int http_conn_current_message_has_body(struct http_conn *conn);
+void http_conn_current_message_bodyless(struct http_conn *conn);
 
 /* turn read off/on; useful for when the other end is choking */
 void http_conn_stop_reading(struct http_conn *conn);
 void http_conn_start_reading(struct http_conn *conn);
+
+void http_request_free(struct http_request *req);
+void http_response_free(struct http_response *req);
 
 #endif

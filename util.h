@@ -7,6 +7,7 @@
 void *mem_calloc(size_t nmemb, size_t size);
 void *mem_malloc(size_t size);
 char *mem_strdup(const char *str);
+char *mem_strdup_n(const char *str, size_t n);
 void mem_free(void *buf);
 
 void log_debug(const char *msg, ...);
@@ -25,6 +26,15 @@ size_t tokenize(const char *buf, const char *sep, int lim,
 		struct token_list *tokens);
 void free_token_list(struct token_list *tokens);
 
-ev_int64_t parse_int(const char *buf, int base);
+ev_int64_t get_int(const char *buf, int base);
+
+struct url {
+	char *scheme;
+	char *host;
+	int port;
+	char *query;
+};
+struct url *tokenize_url(const char *str);
+void free_url(struct url *url);
 
 #endif

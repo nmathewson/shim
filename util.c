@@ -38,10 +38,24 @@ mem_strdup(const char *str)
 	return ret;
 }
 
+char *
+mem_strdup_n(const char *str, size_t n)
+{
+	char *ret;
+	
+	ret = mem_calloc(1, n + 1);
+	if (!ret)
+		log_fatal("mem_strdup: alloc failed");
+	memcpy(ret, str, n);
+
+	return ret;
+}
+
 void
 mem_free(void *buf)
 {
-	free(buf);
+	if (buf)
+		free(buf);
 }
 
 void
@@ -77,9 +91,7 @@ add_token(const char *buf, size_t len, struct token_list *tokens)
 	struct token *token;
 
 	token = mem_calloc(1, sizeof(*token));
-	token->token = mem_malloc(len + 1);
-	memcpy(token->token, buf, len);
-	token->token[len] = '\0';
+	token->token = mem_strdup_n(buf, len);
 	TAILQ_INSERT_TAIL(tokens, token, next);
 }
 
@@ -124,7 +136,7 @@ free_token_list(struct token_list *tokens)
 }
 
 ev_int64_t
-parse_int(const char *buf, int base)
+get_int(const char *buf, int base)
 {
 	char *endp;
 	ev_int64_t rv;
@@ -136,26 +148,98 @@ parse_int(const char *buf, int base)
 	return rv;
 }
 
+struct url *
+tokenize_url(const char *str)
+{
+	struct url *url;
+	char *p;
+
+#define DUP(dst, src, len) 			\
+	do { 					\
+		if (len == 0) 			\
+			goto fail; 		\
+		dst = mem_strdup_n(src, len); 	\
+	} while (0)
+
+	url = mem_calloc(1, sizeof(*url));
+	url->port = -1;
+
+	p = strstr(str, "://");
+	if (!p) {
+		if (*str != '/')
+			goto fail;
+		else
+			DUP(url->query, str, strlen(str));
+		return url;
+	}
+	
+	DUP(url->scheme, str, p - str);
+	str = p + 3;
+	
+	p = strchr(str, ':');
+	if (p) {
+		long port;
+
+		DUP(url->host, str, p - str);
+		port = strtol(p + 1, &p, 10);
+		if (port < 1 || port > 0xffff)
+			goto fail;
+		if (p) {
+			if (*p == '\0')
+				p = NULL;
+			else if (*p != '/')
+				goto fail;
+		}
+		url->port = port;
+	} else {
+		p = strchr(str, '/');
+		if (p)
+			DUP(url->host, str, p - str);
+		else
+			DUP(url->host, str, strlen(str));
+	}
+
+	if (p)
+		DUP(url->query, p, strlen(p));
+	else
+		url->query = mem_strdup("/");
+
+#undef DUP
+
+	return url;
+
+fail:
+	free_url(url);
+	return NULL;
+}
+
+void
+free_url(struct url *url)
+{
+	if (!url)
+		return;
+
+	mem_free(url->scheme);
+	mem_free(url->host);
+	mem_free(url->query);
+	mem_free(url);
+}
+
 #ifdef TEST_UTIL
 #include <stdio.h>
 #include <stdlib.h>
 
 int main(int argc, char **argv)
 {
-	struct token_list tokens;
-	struct token *token;
-	int n;
-	
-	TAILQ_INIT(&tokens);
+	struct url *url;
 
-	n = tokenize(argv[1], argv[2], atoi(argv[3]), &tokens);
-
-	printf("ntokens %d\n", n);
-	TAILQ_FOREACH(token, &tokens, next) {
-		printf("tok: '%s'\n", token->token);
+	url = tokenize_url(argv[1]);
+	if (url) {
+		printf("%s://%s:%d%s\n", url->scheme, url->host, url->port, url->query);
+		mem_free(url);
+	} else {
+		printf("BAD URL!\n");
 	}
-
-	free_token_list(&tokens);
 	
 	return 0;
 }

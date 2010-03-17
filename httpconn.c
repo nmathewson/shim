@@ -14,15 +14,15 @@
 #include "util.h"
 
 #define METHOD0(conn, slot) \
-	(conn)->cbs.slot((conn), (conn)->cbarg)
+	(conn)->cbs->slot((conn), (conn)->cbarg)
 #define METHOD1(conn, slot, a) \
-	(conn)->cbs.slot((conn), (a), (conn)->cbarg)
+	(conn)->cbs->slot((conn), (a), (conn)->cbarg)
 #define METHOD2(conn, slot, a, b) \
-	(conn)->cbs.slot((conn), (a), (b), (conn)->cbarg)
+	(conn)->cbs->slot((conn), (a), (b), (conn)->cbarg)
 #define METHOD3(conn, slot, a, b, c) \
-	(conn)->cbs.slot((conn), (a), (b), (c), (conn)->cbarg)
+	(conn)->cbs->slot((conn), (a), (b), (c), (conn)->cbarg)
 #define METHOD4(conn, slot, a, b, c, d) \
-	(conn)->cbs.slot((conn), (a), (b), (c), (d), (conn)->cbarg)
+	(conn)->cbs->slot((conn), (a), (b), (c), (d), (conn)->cbarg)
 
 /* max amount of data we can have backlogged on outbuf before choaking */
 static size_t max_write_backlog = 50 * 1024;
@@ -38,9 +38,10 @@ struct http_conn {
 	enum http_type type;
 	int is_choaked;
 	int has_body;
+	int read_paused;
 	int msg_complete_on_eof;
 	int keepalive;
-	struct http_cbs cbs;
+	const struct http_cbs *cbs;
 	void *cbarg;
 	ev_int64_t data_remaining;
 	char *firstline;
@@ -132,18 +133,19 @@ version_to_string(enum http_version v)
 }
 
 static void
-begin_input(struct http_conn *conn)
+begin_message(struct http_conn *conn)
 {
 	// XXX read timeout?
 	assert(conn->headers == NULL && conn->firstline == NULL);
+	assert(!conn->read_paused);
 	conn->headers = mem_calloc(1, sizeof(*conn->headers));
 	TAILQ_INIT(conn->headers);
-	conn->state = STATE_IDLE;
+	conn->state = HTTP_STATE_IDLE;
 	bufferevent_enable(conn->bev, EV_WRITE | EV_READ);
 }
 
 static void
-end_input(struct http_conn *conn, enum http_conn_error err)
+end_message(struct http_conn *conn, enum http_conn_error err)
 {
 	if (conn->firstline)
 		mem_free(conn->firstline);
@@ -151,10 +153,10 @@ end_input(struct http_conn *conn, enum http_conn_error err)
 		headers_clear(conn->headers);
 
 	if (err != ERROR_NONE || !conn->keepalive) {
-		conn->state = STATE_MANGLED;
+		conn->state = HTTP_STATE_MANGLED;
 		bufferevent_disable(conn->bev, EV_WRITE | EV_READ);
 	} else
-		begin_input(conn);
+		begin_message(conn);
 
 	if (err != ERROR_NONE)
 		METHOD1(conn, on_error, err);
@@ -167,9 +169,10 @@ build_request(struct http_conn *conn)
 {
 	struct http_request *req;
 	struct token_list tokens;
-	struct token *method, *uri, *vers;
+	struct token *method, *url, *vers;
 	enum http_method m;
 	enum http_version v;
+	struct url *u = NULL;
 	size_t ntokens;
 
 	assert(conn->type == HTTP_CLIENT);
@@ -182,21 +185,23 @@ build_request(struct http_conn *conn)
 		goto out;
 
 	method = TAILQ_FIRST(&tokens);
-	uri = TAILQ_NEXT(method, next);	
-	vers = TAILQ_NEXT(uri, next);	
+	url = TAILQ_NEXT(method, next);	
+	vers = TAILQ_NEXT(url, next);	
+	u = tokenize_url(url->token);
 
-	if (method_from_string(&m, method->token) < 0 ||
+	if (!u || method_from_string(&m, method->token) < 0 ||
             version_from_string(&v, vers->token) < 0)
 		goto out;
 
 	req = mem_calloc(1, sizeof(*req));
 	req->meth = m;
 	req->vers = v;
-	req->uri = uri->token;
-	uri->token = NULL; /* so free_token_list will skip this */
+	req->url = u;
+	u = NULL;
 	req->headers = conn->headers;
 
 out:
+	free_url(u);
 	free_token_list(&tokens);
 	
 	return req;
@@ -256,7 +261,7 @@ parse_chunk_len(struct http_conn *conn)
 			continue;
 		}
 
-		len = parse_int(line, 16);
+		len = get_int(line, 16);
 		if (len < 0) {
 			mem_free(line);
 			log_warn("parse_chunk_len: invalid chunk len");
@@ -274,36 +279,33 @@ static void
 read_chunk(struct http_conn *conn)
 {
 	struct evbuffer *inbuf = bufferevent_get_input(conn->bev);
-	size_t len;
+	size_t len = evbuffer_get_length(inbuf);
+	char *line;
 
-	while ((len = evbuffer_get_length(inbuf))) {
-		if (conn->data_remaining < 0) {
-			switch (parse_chunk_len(conn)) {
-			case -1:
-				end_input(conn, ERROR_CHUNK_PARSE_FAILED);
-				return;
-			case 0:
-				return;	
-			/* case 1: finished, fall thru */
-			}
-
+	if (conn->data_remaining < 0) {
+		if (parse_chunk_len(conn) < 0)
+			end_message(conn, ERROR_CHUNK_PARSE_FAILED);
+	} else if (conn->data_remaining == 0) {
+		line = evbuffer_readln(inbuf, NULL, EVBUFFER_EOL_CRLF);
+		if (line) {
 			/* XXX doesn't handle trailers */
-			/* are we done yet? */
-			if (conn->data_remaining == 0) {
-				end_input(conn, ERROR_NONE);
-				return;
-			}
-			continue;
+			if (*line != '\0')
+				log_warn("http_conn: garbage after last chunk");
+			mem_free(line);		
+			end_message(conn, ERROR_NONE);
+			return;
 		}
-
+	} else {
 		/* XXX should mind potential overflow */
-		if (len >= (size_t)conn->data_remaining) {
+		if (len >= (size_t)conn->data_remaining)
 			len = (size_t)conn->data_remaining;
-			conn->data_remaining = -1;
-		}
 
 		evbuffer_remove_buffer(inbuf, conn->inbuf_processed, len);
 		METHOD1(conn, on_read_body, conn->inbuf_processed);
+		conn->data_remaining -= len;
+
+		if (conn->data_remaining == 0)
+			conn->data_remaining = -1;
 	}
 }
 
@@ -335,7 +337,7 @@ read_body(struct http_conn *conn)
 
 		conn->data_remaining -= len;
 		if (conn->data_remaining == 0)
-			end_input(conn, ERROR_NONE);
+			end_message(conn, ERROR_NONE);
 	}
 }
 
@@ -346,17 +348,11 @@ check_headers(struct http_conn *conn, struct http_request *req,
 	enum http_version vers;
 	int keepalive;
 	char *val;
-	
-	assert(req);
-	assert(conn->type != HTTP_SERVER || resp);
 
 	conn->te = TE_IDENTITY;
 	conn->has_body = 1;
 	conn->msg_complete_on_eof = 0;
 	conn->data_remaining = -1;
-
-	if (req->meth == METH_HEAD)
-		conn->has_body = 0;
 
 	if (conn->type == HTTP_CLIENT) {
 		vers = req->vers;
@@ -385,7 +381,7 @@ check_headers(struct http_conn *conn, struct http_request *req,
 			val = headers_find(conn->headers, "content-length");
 			if (val) {
 				ev_int64_t iv;
-				iv = parse_int(val, 10);
+				iv = get_int(val, 10);
 				if (iv < 0)
 					log_warn("http_conn: mangled Content-Length");
 				else
@@ -435,12 +431,11 @@ parse_headers(struct http_conn *conn)
 	struct http_request *req = NULL;
 	struct http_response *resp = NULL;
 
-	assert(conn->state == STATE_READ_HEADERS);
+	assert(conn->state == HTTP_STATE_READ_HEADERS);
 
 	switch (headers_parse(conn->headers, inbuf)) {
 	case -1:
-		conn->state = STATE_MANGLED;
-		METHOD1(conn, on_error, ERROR_HEADER_PARSE_FAILED);
+		end_message(conn, ERROR_HEADER_PARSE_FAILED);
 		return;
 	case 0:
 		return;
@@ -464,7 +459,7 @@ parse_headers(struct http_conn *conn)
 
 	if (failed) {
 		assert(!req && !resp);
-		end_input(conn, ERROR_HEADER_PARSE_FAILED);
+		end_message(conn, ERROR_HEADER_PARSE_FAILED);
 		return;
 	}
 
@@ -477,12 +472,10 @@ parse_headers(struct http_conn *conn)
 	if (resp)
 		METHOD1(conn, on_server_response, resp);
 
-	if (conn->has_body) {
-		conn->state = STATE_READ_BODY;
-		read_body(conn);
-	} else {
-		end_input(conn, ERROR_NONE);
-	}
+	if (!conn->has_body)
+		end_message(conn, ERROR_NONE);
+	else
+		conn->state = HTTP_STATE_READ_BODY;
 }
 
 static void
@@ -491,29 +484,40 @@ http_errorcb(struct bufferevent *bev, short what, void *_conn)
 	enum http_state state;
 	struct http_conn *conn = _conn;
 
+	if (conn->state == HTTP_STATE_CONNECTING) {
+		if (what & BEV_EVENT_CONNECTED) {
+			begin_message(conn);
+			METHOD0(conn, on_connect);
+		} else {	
+			conn->state = HTTP_STATE_MANGLED;
+			METHOD1(conn, on_error, ERROR_CONNECT_FAILED);
+		}
+		return;
+	}
+
 	assert(!(what & BEV_EVENT_CONNECTED));
-	
+
 	state = conn->state;
-	conn->state = STATE_MANGLED;
+	conn->state = HTTP_STATE_MANGLED;
 
 	if (what & BEV_EVENT_WRITING) {
-		end_input(conn, ERROR_WRITE_FAILED);
+		end_message(conn, ERROR_WRITE_FAILED);
 		return;
 	}
 	
 	switch (state) {
-	case STATE_IDLE:
-		end_input(conn, ERROR_IDLE_CONN_TIMEDOUT);
+	case HTTP_STATE_IDLE:
+		end_message(conn, ERROR_IDLE_CONN_TIMEDOUT);
 		break;
-	case STATE_READ_FIRSTLINE:
-	case STATE_READ_HEADERS:
-		end_input(conn, ERROR_INCOMPLETE_HEADERS);
+	case HTTP_STATE_READ_FIRSTLINE:
+	case HTTP_STATE_READ_HEADERS:
+		end_message(conn, ERROR_INCOMPLETE_HEADERS);
 		break;
-	case STATE_READ_BODY:
+	case HTTP_STATE_READ_BODY:
 		if ((what & BEV_EVENT_EOF) && conn->msg_complete_on_eof)
-			end_input(conn, ERROR_NONE);
+			end_message(conn, ERROR_NONE);
 		else
-			end_input(conn, ERROR_INCOMPLETE_BODY);
+			end_message(conn, ERROR_INCOMPLETE_BODY);
 		break;
 	default:
 		log_fatal("http_conn: errorcb called in invalid state");
@@ -521,32 +525,47 @@ http_errorcb(struct bufferevent *bev, short what, void *_conn)
 }
 
 static void
-http_readcb(struct bufferevent *bev, void *_conn)
+process_one_message(struct http_conn *conn)
 {
-	struct http_conn *conn = _conn;
-	struct evbuffer *inbuf = bufferevent_get_input(bev);
+	struct evbuffer *inbuf = bufferevent_get_input(conn->bev);
 
 	switch (conn->state) {
-	case STATE_IDLE:
-		conn->state = STATE_READ_FIRSTLINE;		
+	case HTTP_STATE_IDLE:
+		conn->state = HTTP_STATE_READ_FIRSTLINE;
+		// XXX should remove idle timeout at this point?
 		/* fallthru... */
-	case STATE_READ_FIRSTLINE:
+	case HTTP_STATE_READ_FIRSTLINE:
 		assert(conn->firstline == NULL);
 		conn->firstline = evbuffer_readln(inbuf, NULL, EVBUFFER_EOL_CRLF);
-		if (conn->firstline) {
-			conn->state = STATE_READ_HEADERS;
-			parse_headers(conn);
-		}
+		if (conn->firstline)
+			conn->state = HTTP_STATE_READ_HEADERS;
 		break;	
-	case STATE_READ_HEADERS:
+	case HTTP_STATE_READ_HEADERS:
 		parse_headers(conn);
 		break;
-	case STATE_READ_BODY:
+	case HTTP_STATE_READ_BODY:
 		read_body(conn);
 		break;
 	default:
 		log_fatal("http_conn: read cb called in invalid state");	
 	}
+}
+
+static void
+flush_inbuf(struct http_conn *conn)
+{
+	struct evbuffer *inbuf = bufferevent_get_input(conn->bev);
+
+	do {
+		process_one_message(conn);
+	} while (!conn->read_paused &&
+		 evbuffer_get_length(inbuf) > 0);
+}
+
+static void
+http_readcb(struct bufferevent *bev, void *_conn)
+{
+	flush_inbuf(_conn);
 }
 
 static void
@@ -563,14 +582,14 @@ http_writecb(struct bufferevent *bev, void *_conn)
 
 struct http_conn *
 http_conn_new(struct event_base *base, evutil_socket_t sock,
-	      enum http_type type, struct http_cbs *cbs, void *cbarg)
+	      enum http_type type, const struct http_cbs *cbs, void *cbarg)
 {
 	struct http_conn *conn;
 
 	conn = mem_calloc(1, sizeof(*conn));
 	conn->type = type;
-	// XXX if cbs contains null cbs, we should add reasonable defaults
-	memcpy(&conn->cbs, cbs, sizeof(*cbs));
+	conn->cbs = cbs;
+	conn->cbarg = cbarg;
 	conn->bev = bufferevent_socket_new(base, sock,
 			BEV_OPT_CLOSE_ON_FREE);
 	if (!conn->bev)
@@ -582,10 +601,21 @@ http_conn_new(struct event_base *base, evutil_socket_t sock,
 
 	bufferevent_setcb(conn->bev, http_readcb, http_writecb,
 		          http_errorcb, conn);
-
-	begin_input(conn);
+	
+	if (sock >= 0)
+		begin_message(conn);
 
 	return conn;
+}
+
+int
+http_conn_connect(struct http_conn *conn, struct evdns_base *dns,
+		      int family, const char *host, int port)
+{
+	// XXX need SOCKS
+	conn->state = HTTP_STATE_CONNECTING;
+	return bufferevent_socket_connect_hostname(conn->bev, dns, family,
+					    	   host, port);	
 }
 
 void
@@ -597,9 +627,30 @@ http_conn_free(struct http_conn *conn)
 }
 
 void
+http_conn_write_request(struct http_conn *conn, struct http_request *req)
+{
+	struct evbuffer *outbuf;
+
+	assert(conn->type == HTTP_SERVER);
+
+	// XXX note the TE of resp
+
+	outbuf = bufferevent_get_output(conn->bev);
+
+	evbuffer_add_printf(outbuf, "%s %s %s\r\n",
+		method_to_string(req->meth),
+		req->url->query,
+		version_to_string(req->vers));
+		
+	headers_dump(req->headers, outbuf);	
+}
+
+void
 http_conn_write_response(struct http_conn *conn, struct http_response *resp)
 {
 	struct evbuffer *outbuf;
+
+	assert(conn->type == HTTP_CLIENT);
 
 	// XXX note the TE of resp
 
@@ -636,47 +687,98 @@ http_conn_write_buf(struct http_conn *conn, struct evbuffer *buf)
 }
 
 int
-http_conn_has_body(struct http_conn *conn)
+http_conn_current_message_has_body(struct http_conn *conn)
 {
 	return conn->has_body;
+}
+
+void
+http_conn_current_message_bodyless(struct http_conn *conn)
+{
+	assert(conn->type == HTTP_SERVER);
+	conn->has_body = 0;
 }
 
 void
 http_conn_stop_reading(struct http_conn *conn)
 {
 	bufferevent_disable(conn->bev, EV_READ);
+	conn->read_paused = 1;
 }
 
 void
 http_conn_start_reading(struct http_conn *conn)
 {
+	struct evbuffer *inbuf = bufferevent_get_input(conn->bev);
+
 	bufferevent_enable(conn->bev, EV_READ);
+	conn->read_paused = 0;
+	// XXX this might cause recursion
+	if (evbuffer_get_length(inbuf) > 0)
+		flush_inbuf(conn);
+}
+
+void
+http_request_free(struct http_request *req)
+{
+	free_url(req->url);
+	headers_free(req->headers);
+	mem_free(req);
+}
+
+void
+http_response_free(struct http_response *resp)
+{
+	headers_free(resp->headers);
+	mem_free(resp->reason);
+	mem_free(resp);
 }
 
 #ifdef TEST_HTTP
 #include <netinet/in.h>
 #include <stdio.h>
-#include <event2/listener.h>
+#include <event2/dns.h>
+
+static void
+proxy_connected(struct http_conn *conn, void *arg)
+{
+	struct http_request req;
+	struct header_list headers;
+	struct evbuffer *buf;
+
+	TAILQ_INIT(&headers);
+	req.meth = METH_GET;
+	req.url = arg;
+	req.vers = HTTP_11;
+	req.headers = &headers;	
+
+	buf = evbuffer_new();
+	evbuffer_add_printf(buf, "Host: %s\r\n\r\n", req.url->host);
+	headers_parse(&headers, buf);
+	evbuffer_free(buf);
+
+	http_conn_write_request(conn, &req);
+}
 
 static void
 proxy_error(struct http_conn *conn, enum http_conn_error err, void *arg)
 {
 	fprintf(stderr, "error %d\n", err);
+	http_conn_free(conn);
 }
 
 static void
-proxy_client_request(struct http_conn *conn, struct http_request *req, void *arg)
+proxy_response(struct http_conn *conn, struct http_response *resp, void *arg)
 {
 	struct evbuffer *buf;
 
-	//XXX need a way to free req
-	fprintf(stderr, "new request: %s, %s, %s\n",
-		method_to_string(req->meth),
-		req->uri,
-		version_to_string(req->vers));
+	fprintf(stderr, "response: %s, %d, %s\n",
+		version_to_string(resp->vers),
+		resp->code,
+		resp->reason);
 
 	buf = evbuffer_new();
-	headers_dump(req->headers, buf);
+	headers_dump(resp->headers, buf);
 	fwrite(evbuffer_pullup(buf, evbuffer_get_length(buf)), evbuffer_get_length(buf), 1, stderr);
 	evbuffer_free(buf);
 }
@@ -700,40 +802,36 @@ proxy_write_more(struct http_conn *conn, void *arg)
 {
 }
 
-static struct http_cbs test_proxy_client_cbs = {
+static struct http_cbs test_proxy_cbs = {
+	proxy_connected,
 	proxy_error,
-	proxy_client_request,
 	0,
+	proxy_response,
 	proxy_read_body,
 	proxy_msg_complete,
 	proxy_write_more
 };
 
-static void
-accept_cb(struct evconnlistener *listener, evutil_socket_t sock,
-	  struct sockaddr *addr, int socklen, void *arg)
-{
-	struct http_conn *conn;
-
-	conn = http_conn_new(evconnlistener_get_base(listener), sock,
-			     HTTP_CLIENT, &test_proxy_client_cbs, NULL);
-}
-
 int
-main()
+main(int argc, char **argv)
 {
-	struct sockaddr_in sin;
 	struct event_base *base;
-	struct evconnlistener *listener;
+	struct evdns_base *dns;
+	struct http_conn *http;
+	struct url *url;
 
-	memset(&sin, 0, sizeof(sin));
-	sin.sin_family = AF_INET;
-	sin.sin_port = htons(8080);
+	url = tokenize_url(argv[1]);
+	if (!url)
+		return 0;
+
+	if (url->port < 0)
+		url->port = 80;
 
 	base = event_base_new();
-	listener = evconnlistener_new_bind(base, accept_cb, NULL,
-			LEV_OPT_CLOSE_ON_FREE | LEV_OPT_REUSEABLE,
-			-1, (struct sockaddr *)&sin, sizeof(sin));
+	dns = evdns_base_new(base, 1);
+
+	http = http_conn_new(base, -1, HTTP_SERVER, &test_proxy_cbs, url);
+	http_conn_connect(http, dns, AF_UNSPEC, url->host, url->port);
 
 	event_base_dispatch(base);
 
