@@ -123,7 +123,7 @@ tokenize(const char *buf, const char *sep, int lim,
 }
 
 void
-free_token_list(struct token_list *tokens)
+token_list_clear(struct token_list *tokens)
 {
 	struct token *token;
 
@@ -149,7 +149,7 @@ get_int(const char *buf, int base)
 }
 
 struct url *
-tokenize_url(const char *str)
+url_tokenize(const char *str)
 {
 	struct url *url;
 	char *p;
@@ -209,12 +209,12 @@ tokenize_url(const char *str)
 	return url;
 
 fail:
-	free_url(url);
+	url_free(url);
 	return NULL;
 }
 
 void
-free_url(struct url *url)
+url_free(struct url *url)
 {
 	if (!url)
 		return;
@@ -233,10 +233,10 @@ int main(int argc, char **argv)
 {
 	struct url *url;
 
-	url = tokenize_url(argv[1]);
+	url = url_tokenize(argv[1]);
 	if (url) {
 		printf("%s://%s:%d%s\n", url->scheme, url->host, url->port, url->query);
-		mem_free(url);
+		url_free(url);
 	} else {
 		printf("BAD URL!\n");
 	}

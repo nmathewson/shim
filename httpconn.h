@@ -93,7 +93,7 @@ void http_conn_free(struct http_conn *conn);
 void http_conn_write_request(struct http_conn *conn, struct http_request *req);
 void http_conn_write_response(struct http_conn *conn, struct http_response *resp);
 
-/* return: -1 on failure, 0 on choaked, 1 on queued. */
+/* return: 0 on choaked, 1 on queued. */
 int http_conn_write_buf(struct http_conn *conn, struct evbuffer *buf);
 
 int http_conn_current_message_has_body(struct http_conn *conn);

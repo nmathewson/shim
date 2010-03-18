@@ -187,7 +187,7 @@ build_request(struct http_conn *conn)
 	method = TAILQ_FIRST(&tokens);
 	url = TAILQ_NEXT(method, next);	
 	vers = TAILQ_NEXT(url, next);	
-	u = tokenize_url(url->token);
+	u = url_tokenize(url->token);
 
 	if (!u || method_from_string(&m, method->token) < 0 ||
             version_from_string(&v, vers->token) < 0)
@@ -201,8 +201,8 @@ build_request(struct http_conn *conn)
 	req->headers = conn->headers;
 
 out:
-	free_url(u);
-	free_token_list(&tokens);
+	url_free(u);
+	token_list_clear(&tokens);
 	
 	return req;
 }
@@ -238,11 +238,11 @@ build_response(struct http_conn *conn)
 	resp->vers = v;
 	resp->code = c;
 	resp->reason = reason->token;
-	reason->token = NULL; /* so free_token_list will skip this */
+	reason->token = NULL; /* so token_list_clear will skip this */
 	resp->headers = conn->headers;
 
 out:
-	free_token_list(&tokens);
+	token_list_clear(&tokens);
 	
 	return resp;
 }
@@ -387,6 +387,8 @@ check_headers(struct http_conn *conn, struct http_request *req,
 				else
 					conn->data_remaining = iv;
 				mem_free(val);
+				if (conn->data_remaining == 0)
+					conn->has_body = 0;
 			} else {
 				conn->msg_complete_on_eof = 1;
 			}
@@ -721,15 +723,15 @@ http_conn_start_reading(struct http_conn *conn)
 void
 http_request_free(struct http_request *req)
 {
-	free_url(req->url);
-	headers_free(req->headers);
+	url_free(req->url);
+	headers_clear(req->headers);
 	mem_free(req);
 }
 
 void
 http_response_free(struct http_response *resp)
 {
-	headers_free(resp->headers);
+	headers_clear(resp->headers);
 	mem_free(resp->reason);
 	mem_free(resp);
 }
@@ -820,7 +822,7 @@ main(int argc, char **argv)
 	struct http_conn *http;
 	struct url *url;
 
-	url = tokenize_url(argv[1]);
+	url = url_tokenize(argv[1]);
 	if (!url)
 		return 0;
 

@@ -24,7 +24,7 @@ TAILQ_HEAD(token_list, token) token;
 
 size_t tokenize(const char *buf, const char *sep, int lim,
 		struct token_list *tokens);
-void free_token_list(struct token_list *tokens);
+void token_list_clear(struct token_list *tokens);
 
 ev_int64_t get_int(const char *buf, int base);
 
@@ -34,7 +34,7 @@ struct url {
 	int port;
 	char *query;
 };
-struct url *tokenize_url(const char *str);
-void free_url(struct url *url);
+struct url *url_tokenize(const char *str);
+void url_free(struct url *url);
 
 #endif
