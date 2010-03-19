@@ -12,6 +12,7 @@
 #include "httpconn.h"
 #include "headers.h"
 #include "util.h"
+#include "log.h"
 
 #define METHOD0(conn, slot) \
 	(conn)->cbs->slot((conn), (conn)->cbarg)
@@ -40,7 +41,7 @@ struct http_conn {
 	int has_body;
 	int read_paused;
 	int msg_complete_on_eof;
-	int keepalive;
+	int persistent;
 	const struct http_cbs *cbs;
 	void *cbarg;
 	ev_int64_t data_remaining;
@@ -152,7 +153,7 @@ end_message(struct http_conn *conn, enum http_conn_error err)
 	if (conn->headers)
 		headers_clear(conn->headers);
 
-	if (err != ERROR_NONE || !conn->keepalive) {
+	if (err != ERROR_NONE || !conn->persistent) {
 		conn->state = HTTP_STATE_MANGLED;
 		bufferevent_disable(conn->bev, EV_WRITE | EV_READ);
 	} else
@@ -346,7 +347,7 @@ check_headers(struct http_conn *conn, struct http_request *req,
 	   struct http_response *resp)
 {
 	enum http_version vers;
-	int keepalive;
+	int persistent;
 	char *val;
 
 	conn->te = TE_IDENTITY;
@@ -404,29 +405,29 @@ check_headers(struct http_conn *conn, struct http_request *req,
 
 	assert(vers != HTTP_UNKNOWN);
 
-	keepalive = 0;
+	persistent = 0;
 	if (!conn->msg_complete_on_eof && vers == HTTP_11)
-		keepalive = 1;
+		persistent = 1;
 
 	if (conn->vers != HTTP_UNKNOWN && conn->vers != vers) {
 		log_warn("http_conn: http version changed!");
-		keepalive = 0;
+		persistent = 0;
 	}
 	conn->vers = vers;
 
-	if (keepalive) {
+	if (persistent) {
 		val = headers_find(conn->headers, "connection");
 		if (val) {
 			if (evutil_ascii_strcasecmp(val, "close"))
-				keepalive = 0;
+				persistent = 0;
 			mem_free(val);
 		}
 	}
-	conn->keepalive = keepalive;
+	conn->persistent = persistent;
 }
 
 static void
-parse_headers(struct http_conn *conn)
+read_headers(struct http_conn *conn)
 {
 	int failed = 0;
 	struct evbuffer *inbuf = bufferevent_get_input(conn->bev);
@@ -435,7 +436,7 @@ parse_headers(struct http_conn *conn)
 
 	assert(conn->state == HTTP_STATE_READ_HEADERS);
 
-	switch (headers_parse(conn->headers, inbuf)) {
+	switch (headers_load(conn->headers, inbuf)) {
 	case -1:
 		end_message(conn, ERROR_HEADER_PARSE_FAILED);
 		return;
@@ -543,7 +544,7 @@ process_one_message(struct http_conn *conn)
 			conn->state = HTTP_STATE_READ_HEADERS;
 		break;	
 	case HTTP_STATE_READ_HEADERS:
-		parse_headers(conn);
+		read_headers(conn);
 		break;
 	case HTTP_STATE_READ_BODY:
 		read_body(conn);
@@ -554,7 +555,7 @@ process_one_message(struct http_conn *conn)
 }
 
 static void
-flush_inbuf(struct http_conn *conn)
+process_inbuf(struct http_conn *conn)
 {
 	struct evbuffer *inbuf = bufferevent_get_input(conn->bev);
 
@@ -567,19 +568,21 @@ flush_inbuf(struct http_conn *conn)
 static void
 http_readcb(struct bufferevent *bev, void *_conn)
 {
-	flush_inbuf(_conn);
+	process_inbuf(_conn);
 }
 
 static void
 http_writecb(struct bufferevent *bev, void *_conn)
 {
 	struct http_conn *conn = _conn;
+	struct evbuffer *outbuf = bufferevent_get_output(bev);
 
 	if (conn->is_choaked) {
 		bufferevent_setwatermark(bev, EV_WRITE, 0, 0);
 		conn->is_choaked = 0;
 		METHOD0(conn, on_write_more);
-	}
+	} else if (evbuffer_get_length(outbuf) == 0)
+		METHOD0(conn, on_flush);
 }
 
 struct http_conn *
@@ -695,10 +698,16 @@ http_conn_current_message_has_body(struct http_conn *conn)
 }
 
 void
-http_conn_current_message_bodyless(struct http_conn *conn)
+http_conn_set_current_message_bodyless(struct http_conn *conn)
 {
 	assert(conn->type == HTTP_SERVER);
 	conn->has_body = 0;
+}
+
+int
+http_conn_is_persistent(struct http_conn *conn)
+{
+	return conn->persistent;
 }
 
 void
@@ -717,7 +726,38 @@ http_conn_start_reading(struct http_conn *conn)
 	conn->read_paused = 0;
 	// XXX this might cause recursion
 	if (evbuffer_get_length(inbuf) > 0)
-		flush_inbuf(conn);
+		process_inbuf(conn);
+}
+
+void
+http_conn_flush(struct http_conn *conn)
+{
+	struct evbuffer *outbuf = bufferevent_get_outbuf(conn->bev);
+
+	// XXX this might cause recursion
+	if (evbuffer_get_length(outbuf) == 0)
+		METHOD0(conn, on_flush);
+}
+
+void
+http_conn_send_error(struct http_conn *conn, int code)
+{
+	struct http_response resp;
+	struct header_list headers;
+
+	resp.headers = &headers;
+	
+	TAILQ_INIT(headers);
+
+	headers_add_key(&headers, "Connection");
+	if (conn->state == HTTP_STATE_READ_BODY ||
+	    !conn->persistent) {
+		headers_add_value(&headers, "close");
+	} else {
+		headers_add_value(&headers, "keep-alive");
+	}
+	// XXX
+	headers_clear(&headers);
 }
 
 void
@@ -732,6 +772,7 @@ void
 http_response_free(struct http_response *resp)
 {
 	headers_clear(resp->headers);
+	mem_free(resp->headers);
 	mem_free(resp->reason);
 	mem_free(resp);
 }
@@ -756,7 +797,7 @@ proxy_connected(struct http_conn *conn, void *arg)
 
 	buf = evbuffer_new();
 	evbuffer_add_printf(buf, "Host: %s\r\n\r\n", req.url->host);
-	headers_parse(&headers, buf);
+	headers_load(&headers, buf);
 	evbuffer_free(buf);
 
 	http_conn_write_request(conn, &req);

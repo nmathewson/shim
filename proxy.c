@@ -8,15 +8,14 @@ enum server_state {
 	SERVER_STATE_INITIAL,
 	SERVER_STATE_CONNECTING,
 	SERVER_STATE_CONNECTED,
-	SERVER_STATE_PIPELINE_PROBE,
-	SERVER_STATE_PIPELINE_NONE,
-	SERVER_STATE_PIPELINE_OK,
+	SERVER_STATE_REQUEST_SENT,
 	SERVER_STATE_IDLE
 };
 
 struct server {
 	TAILQ_ENTRY(server) next;
 	enum server_state state;
+	size_t nserviced;
 	char *host;
 	int port;
 	struct http_conn *conn;
@@ -24,11 +23,17 @@ struct server {
 };
 TAILQ_HEAD(server_list, server);
 
+enum client_state {
+	CLIENT_STATE_ACTIVE,
+	CLIENT_STATE_CLOSING
+};
+
 struct client {
+	enum client_state state;
 	struct server_list requests;
 	size_t nrequests;
 	struct http_conn *conn;
-	struct server *active;
+	struct server *server;
 };
 
 static void on_client_error(struct http_conn *, enum http_conn_error, void *);
@@ -51,7 +56,8 @@ static const struct http_cbs client_methods = {
 	0,
 	on_client_read_body,
 	on_client_msg_complete,
-	on_client_write_more
+	on_client_write_more,
+	on_client_flush
 };
 
 static const struct http_cbs server_methods = {
@@ -61,7 +67,8 @@ static const struct http_cbs server_methods = {
 	on_server_response,
 	on_server_read_body,
 	on_server_msg_complete,
-	on_server_write_more
+	on_server_write_more,
+	on_server_flush
 };
 
 static struct event_base *proxy_event_base;
@@ -84,6 +91,17 @@ server_new(const char *host, int port)
 	return server;
 }
 
+static void
+server_free(struct server *server)
+{
+	if (!server)
+		return;
+
+	mem_free(server->host);
+	http_conn_free(server->conn);
+	mem_free(server);
+}
+
 static int
 server_connect(struct server *server)
 {
@@ -92,28 +110,26 @@ server_connect(struct server *server)
 				 server->host, server->port);
 }
 
-static void
-server_write_requests(struct server *server, struct http_request_list *reqs)
+static int
+server_write_client_request(struct server *server)
 {
 	struct http_request *req;
 
-	if (server->state == SERVER_STATE_PIPELINE_PROBE ||
-	    server->state < SERVER_STATE_CONNECTED)
-		return;
+	req = TAILQ_FIRST(&server->client->requests);
 	
-	TAILQ_FOREACH(req, reqs, next) {
-		if (evutil_ascii_strcasecmp(server->host, req->url->host) ||
-		    server->port != req->url->port)
-			break;
-		
+	if (!req || server->state == SERVER_STATE_REQUEST_SENT ||
+	    server->state < SERVER_STATE_CONNECTED)
+		return 0;
+
+	/* it might be nice to support pipelining... */
+	if (!evutil_ascii_strcasecmp(server->host, req->url->host) &&
+	    server->port == req->url->port) {
 		http_conn_write_request(server->conn, req);
-		if (server->state == SERVER_STATE_CONNECTED) {
-			/* we'll need to wait for the response to see if we can
- 			   reuse this connection. */
-			server->state = SERVER_STATE_PIPELINE_PROBE;
-			return;
-		}
+		server->state = SERVER_STATE_REQUEST_SENT;
+		return 1;
 	}
+
+	return 0;
 }
 
 static struct client *
@@ -129,10 +145,55 @@ client_new(evutil_socket_t sock)
 	return client;
 }
 
+static void
+client_free(struct client *client)
+{
+	struct http_request *req;
+
+	if (!client)
+		return;
+
+	while ((req = TAILQ_FIRST(&client->requests))) {
+		TAILQ_REMOVE(req, &client->requests, next);
+		http_request_free(req);
+	}
+
+	server_free(client->server);
+	http_conn_free(client->conn);
+	mem_free(client);
+}
+
 static int
 client_scrub_request(struct client *client, struct http_request *req)
 {
 	// prune headers; verify that req contains a host to connect to
+	// XXX remove proxy auth msgs?
+	
+	if (!req->url->host) {
+		http_conn_send_error(client->conn, 401);
+		goto fail;
+	}
+	if (evutil_ascii_strcasecmp(req->url->scheme, "http")) {
+		http_conn_send_error(client->conn, 400);
+		goto fail;
+	}
+
+	if (req->url->port < 0)
+		req->url->port = 80;
+
+	headers_remove(req->headers, "connection");
+
+	return 0;
+
+fail:
+	http_request_free(req);
+	return -1;
+}
+
+static int
+client_scrub_response(struct client *client, struct http_response *resp)
+{
+	headers_remove(req->headers, "connection");
 }
 
 static int
@@ -161,6 +222,14 @@ client_associate_server(struct client *client, const struct url *url)
 }
 
 static void
+client_start_reading_request_body(struct client *client)
+{
+	if (http_conn_current_message_has_body(client->conn) &&
+	    client->nrequests == 1)
+		http_conn_start_reading(client->conn);
+}
+
+static void
 client_request_serviced(struct client *client)
 {
 	struct http_request *req;
@@ -168,19 +237,38 @@ client_request_serviced(struct client *client)
 	assert(client->nrequests > 0)
 
 	// - pop the first req on our req list
-	// - if we've stopped reading, start again:
-	// 	* if we're going to read a message body wait until theres only one pending request
-	// 	* otherwise we can just start accepting more reqs
-	//
+	// - if the server's connection isn't persistent, we should terminate the server connection.
+	// - if the client's connection isn't persistent, we should terminate the client connection.
+	// - if we expect more reqs on the client connection, start reading again in case we stopped
+	//   earlier.
 	
 	req = TAILQ_FIRST(&client->requests);
 	TAILQ_REMOVE(&client->requests, req, next);
 	http_request_free(req);
 	client->nrequests--;
 
-	if (!http_conn_current_message_has_body(client->conn) ||
-	    client->nrequests == 1)
+	/* let's try to reuse this server connection */
+	if (http_conn_is_persistent(client->server->conn)) {
+		if (!server_write_client_request(client->server)) {
+			client->server->state = SERVER_STATE_IDLE;
+			TAILQ_INSERT_TAIL(&idle_servers, client->server, next);
+			client->server->client = NULL;
+			client->server = NULL;
+		}
+	} else {
+		server_free(client->server);
+		client->server = NULL;
+	}
+
+	if (!http_conn_is_persistent(client->conn)) {
+		// XXX maybe shutdown the socket?
+		client->state = STATE_CLIENT_CLOSING;
+		http_conn_stop_reading(client->conn);
+		http_conn_flush(client->conn);
+	} else if (!http_conn_current_message_has_body(client->conn) &&
+		   client->nrequests < max_pending_requests) {
 		http_conn_start_reading(client->conn);
+	}
 }
 
 static void
@@ -194,6 +282,9 @@ client_notice_server_failed(struct client *client)
 static void
 on_client_error(struct http_conn *conn, enum http_conn_error err, void *arg)
 {
+	// what can we do here?
+	log_warn("proxy: client connection failed.");
+	client_free(arg);
 }
 
 static void
@@ -212,18 +303,20 @@ on_client_request(struct http_conn *conn, struct http_request *req, void *arg)
 	//   and the server is known to support pipelining, write the request to
 	//   the server
 
+	assert(client->state == CLIENT_STATE_ACTIVE);
+
 	if (client_scrub_request(client, req) < 0)
 		return;
 
 	TAILQ_INSERT_TAIL(&client->requests, req, next);
 	if (++client->nrequests > max_pending_requests ||
 	    http_conn_current_message_has_body(conn))
-		http_conn_stop_reading(conn); // XXX when to start reading again?
+		http_conn_stop_reading(conn);
 
 	if (!client->server && client_associate_server(client, req->url) < 0)
 		return;
 
-	server_write_requests(client->server, &client->requests);
+	server_write_client_request(client->server);
 }
 
 static void
@@ -250,13 +343,23 @@ on_client_write_more(struct http_conn *conn, void *arg)
 }
 
 static void
+on_client_flush(struct http_conn *conn, void *arg)
+{
+	struct client *client = arg;
+
+	// XXX perhaps delay before closing?
+	if (client->state == CLIENT_STATE_CLOSING)
+		client_free(client);
+}
+
+static void
 on_server_connected(struct http_conn *conn, void *arg)
 {
 	struct server *server = arg;
 
 	assert(server->state == SERVER_STATE_CONNECTING);
 	server->state = SERVER_STATE_CONNECTED;
-	server_write_requests(server, &server->client->requests);
+	server_write_client_request(server);
 }
 
 static void
@@ -267,10 +370,9 @@ on_server_error(struct http_conn *conn, enum http_conn_error err, void *arg)
 	switch (server->state) {
 	case SERVER_STATE_CONNECTING:
 	case SERVER_STATE_CONNECTED:
-		// XXX perhaps auto retry connection failures??
-	case SERVER_STATE_PIPELINE_PROBE:
-	case SERVER_STATE_PIPELINE_NONE:
-	case SERVER_STATE_PIPELINE_OK:
+	case SERVER_STATE_REQUEST_SENT:
+		// XXX if we haven't serviced any reqs on this server yet,
+		//     we should try resending the first request
 		assert(server->client != NULL);
 		client_notice_server_failed(server->client);
 		break;
@@ -282,14 +384,19 @@ on_server_error(struct http_conn *conn, enum http_conn_error err, void *arg)
 		log_fatal("server: error cb called in invalid state");
 	}
 
-	// XXX free server
+	server_free(server);
 }
 
 static void
-on_server_response(struct http_conn *conn, struct http_response *req, void *arg)
+on_server_response(struct http_conn *conn, struct http_response *resp, void *arg)
 {
-	// tell if this server can do pipelining. if the connection only
-	// supports one request, then we'll have to remove it once it's complete.
+	struct server *server = arg;
+	
+	// XXX anything we need to do scrub this response?
+	http_conn_write_response(server->client->conn, resp);
+	// XXX maybe not read body on error?
+	// XXX handle expect 100-continue, etc
+	client_start_reading_body(server->client);
 }
 
 static void
@@ -315,4 +422,81 @@ on_server_write_more(struct http_conn *conn, void *arg)
 	struct server *server = arg;
 
 	http_conn_start_reading(server->client->conn);
+}
+
+static void
+on_server_flush(struct http_conn *conn, void *arg)
+{
+}
+
+static void
+client_accept(struct evconnlistener *ecs, evutil_socket_t s,
+	      struct sockaddr *addr, int len, void *arg) 
+{
+	struct client *client;
+
+	client = client_new(s);
+	// XXX do we want to keep track of the client obj somehow?
+}
+
+/* public API */
+
+void
+proxy_client_set_max_pending_requests(size_t nreqs)
+{
+	max_pending_requests = nreqs;
+}
+
+size_t
+proxy_client_get_max_pending_requests(void)
+{
+	return max_pending_requests;
+}
+
+int
+proxy_init(const struct sockaddr *listen_here, int socklen)
+{
+	struct evconlistener *lcs = NULL;
+	struct event_base *base = NULL;
+	struct evdns_base *dns = NULL;
+
+	base = event_base_new();
+	if (!base)
+		goto fail;
+
+	dns = evdns_base_new(base, 1);
+	if (!dns)
+		goto fail;
+
+	lcs = evconnlistener_new_bind(base, client_accept, NULL, CLOSE_ON_FREE,
+					-1, listen_here, len);
+
+	if (!lcs) {
+		log_error("proxy: couldn't listen on %s: %s",
+			  format_addr(listen_here),
+			  socket_error_string(-1));
+		goto fail;
+	}
+	
+	listener = lcs;
+	proxy_event_base = base;
+	proxy_evdns_base = dns;	
+
+	return 0;
+
+fail:
+	if (ecs)
+		evconlistener_free(ecs);
+	if (dns)
+		evdns_base_free(dns, 0);
+	if (base)
+		event_base_free(base);
+
+	return -1;
+}
+
+void
+proxy_cleanup(void)
+{
+	// TODO
 }

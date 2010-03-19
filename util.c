@@ -1,6 +1,8 @@
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include "util.h"
+#include "log.h"
 
 void *
 mem_calloc(size_t nmemb, size_t size)
@@ -56,33 +58,6 @@ mem_free(void *buf)
 {
 	if (buf)
 		free(buf);
-}
-
-void
-log_debug(const char *msg, ...)
-{
-}
-
-void
-log_notice(const char *msg, ...)
-{
-}
-
-void
-log_warn(const char *msg, ...)
-{
-}
-
-void
-log_error(const char *msg, ...)
-{
-}
-
-void
-log_fatal(const char *msg, ...)
-{
-	// XXX
-	abort();
 }
 
 static void
@@ -223,6 +198,17 @@ url_free(struct url *url)
 	mem_free(url->host);
 	mem_free(url->query);
 	mem_free(url);
+}
+
+const char *
+format_addr(const struct sockaddr *addr)
+{
+}
+
+const char *
+socket_error_string(evutil_socket_t s)
+{
+	return evutil_socket_error_to_string(evutil_socket_geterror(s));
 }
 
 #ifdef TEST_UTIL

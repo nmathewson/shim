@@ -10,12 +10,6 @@ char *mem_strdup(const char *str);
 char *mem_strdup_n(const char *str, size_t n);
 void mem_free(void *buf);
 
-void log_debug(const char *msg, ...);
-void log_notice(const char *msg, ...);
-void log_warn(const char *msg, ...);
-void log_error(const char *msg, ...);
-void log_fatal(const char *msg, ...);
-
 struct token {
 	TAILQ_ENTRY(token) next;
 	char *token;
@@ -36,5 +30,10 @@ struct url {
 };
 struct url *url_tokenize(const char *str);
 void url_free(struct url *url);
+
+struct sockaddr;
+
+const char *format_addr(const struct sockaddr *addr);
+const char *socket_error_string(evutil_socket_t s);
 
 #endif

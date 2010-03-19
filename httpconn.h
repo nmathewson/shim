@@ -79,6 +79,8 @@ struct http_cbs {
 
 	/* called when it is ok to write more data after choaking */
 	void (*on_write_more)(struct http_conn *, void *);
+
+	void (*on_flush)(struct http_conn *, void *);
 };
 
 struct http_conn *http_conn_new(struct event_base *base, evutil_socket_t sock,
@@ -97,11 +99,17 @@ void http_conn_write_response(struct http_conn *conn, struct http_response *resp
 int http_conn_write_buf(struct http_conn *conn, struct evbuffer *buf);
 
 int http_conn_current_message_has_body(struct http_conn *conn);
-void http_conn_current_message_bodyless(struct http_conn *conn);
+void http_conn_set_current_message_bodyless(struct http_conn *conn);
+
+int http_conn_is_persistent(struct http_conn *conn);
 
 /* turn read off/on; useful for when the other end is choking */
 void http_conn_stop_reading(struct http_conn *conn);
 void http_conn_start_reading(struct http_conn *conn);
+
+void http_conn_flush(struct http_conn *conn);
+
+void http_conn_send_error(struct http_conn *conn, int code);
 
 void http_request_free(struct http_request *req);
 void http_response_free(struct http_response *req);

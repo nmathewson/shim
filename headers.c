@@ -49,7 +49,7 @@ headers_dump(struct header_list *headers, struct evbuffer *buf)
 
 /* return: -1 error, 0 need more data, 1 finished. */
 int
-headers_parse(struct header_list *headers, struct evbuffer *buf)
+headers_load(struct header_list *headers, struct evbuffer *buf)
 {
 	char *line, *p;
 	
@@ -121,20 +121,44 @@ headers_find(struct header_list *headers, const char *key)
 	return NULL;
 }
 
+static void
+remove_one(struct header_list *headers, struct header *h)
+{
+	struct val_line *line;
+
+	TAILQ_REMOVE(headers, h, next);
+	while ((line = TAILQ_FIRST(&h->val))) {
+		TAILQ_REMOVE(&h->val, line, next);
+		mem_free(line);	
+	}
+	mem_free(h);	
+}
+
 void
 headers_clear(struct header_list *headers)
 {
 	struct header *h;
-	struct val_line *line;
 
-	while ((h = TAILQ_FIRST(headers))) {
-		TAILQ_REMOVE(headers, h, next);
-		while ((line = TAILQ_FIRST(&h->val))) {
-			TAILQ_REMOVE(&h->val, line, next);
-			mem_free(line);	
+	while ((h = TAILQ_FIRST(headers)))
+		remove_one(headers, h);
+}
+
+int
+headers_remove(struct header_list *headers, const char *key)
+{
+	int count;
+	struct header *h, *next;
+	
+	count = 0;
+	for (h = TAILQ_FIRST(headers); h != NULL; h = next) {
+		next = TAILQ_NEXT(h, next);
+		if (!evutil_ascii_strcasecmp(h->key, key)) {
+			count++;
+			remove_one(headers, h);
 		}
-		mem_free(h);	
 	}
+
+	return count;
 }
 
 #ifdef TEST_HEADERS
@@ -153,7 +177,7 @@ int main(int argc, char **argv)
 		evbuffer_add(buf, line, strlen(line));
 	}
 
-	headers_parse(&headers, buf);
+	headers_load(&headers, buf);
 	headers_dump(&headers, buf2);
 
 	printf("buf1..\n");
@@ -167,7 +191,10 @@ int main(int argc, char **argv)
 		for (i = 1; i < argc; ++i) {
 			char *buf = headers_find(&headers, argv[i]);
 			printf("%s? %s\n", argv[i], buf? buf : "NOT FOUND");
-			if (buf) mem_free(buf);
+			if (buf) {
+				mem_free(buf);
+				headers_remove(&headers, argv[i]);
+			}
 		}
 	}
 
