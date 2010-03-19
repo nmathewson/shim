@@ -133,6 +133,65 @@ version_to_string(enum http_version v)
 	return "???";
 }
 
+static const char *
+error_code_to_reason_string(int code)
+{
+	switch (code) {
+	case 400:
+		return "Bad Request";
+	case 401:
+		return "Unauthorized";
+	case 403:
+		return "Forbidden";
+	case 404:
+		return "Not Found";
+	case 405:
+		return "Method Not Allowed";
+	case 406:
+		return "Not Acceptable";
+	case 407:
+		return "Proxy Authentication Required";
+	case 408:
+		return "Request Timeout";
+	case 409:
+		return "Conflict";
+	case 410:
+		return "Gone";
+	case 411:
+		return "Length Required";
+	case 412:
+		return "Precondition Failed";
+	case 413:
+		return "Request Entity Too Large";
+	case 414:
+		return "Request-URI Too Long";
+	case 415:
+		return "Unsupported Media Type";
+	case 416:
+		return "Requested Range Not Satisfiable";
+	case 417:
+		return "Expectation Failed";
+	case 421:
+		return "There are too many connections from your internet address";
+	case 500:
+		return "Internal Server Error";
+	case 501:
+		return "Not Implemented";
+	case 502:
+		return "Bad Gateway";
+	case 503:
+		return "Service Unavailable";
+	case 504:
+		return "Gateway Timeout";
+	case 505:
+		return "HTTP Version Not Supported";
+	case 530:
+		return "User access denied";
+	}
+
+	return "???";
+}
+
 static void
 begin_message(struct http_conn *conn)
 {
@@ -395,8 +454,8 @@ check_headers(struct http_conn *conn, struct http_request *req,
 			}
 		}
 
-		if (conn->type == HTTP_CLIENT && conn->data_remaining < 0
-		    && conn->te != TE_CHUNKED) {
+		if (conn->type == HTTP_CLIENT && conn->data_remaining < 0 &&
+		    conn->te != TE_CHUNKED) {
 			METHOD1(conn, on_error,
 				ERROR_CLIENT_POST_WITHOUT_LENGTH);
 			return;
@@ -424,6 +483,11 @@ check_headers(struct http_conn *conn, struct http_request *req,
 		}
 	}
 	conn->persistent = persistent;
+
+	if (req)
+		req->te = conn->te;
+	else if (resp)
+		resp->te = conn->te;
 }
 
 static void
@@ -638,8 +702,11 @@ http_conn_write_request(struct http_conn *conn, struct http_request *req)
 
 	assert(conn->type == HTTP_SERVER);
 
-	// XXX note the TE of resp
+	headers_remove(req->headers, "connection");
 
+	conn->output_te = req->te;
+	req->vers = HTTP_11;
+		
 	outbuf = bufferevent_get_output(conn->bev);
 
 	evbuffer_add_printf(outbuf, "%s %s %s\r\n",
@@ -656,8 +723,17 @@ http_conn_write_response(struct http_conn *conn, struct http_response *resp)
 	struct evbuffer *outbuf;
 
 	assert(conn->type == HTTP_CLIENT);
+	assert(conn->vers != HTTP_UNKNOWN);
 
-	// XXX note the TE of resp
+	headers_remove(req->headers, "connection");
+	resp->vers = conn->vers;
+
+	conn->output_te = resp->te;
+	if (conn->vers == HTTP_10) {
+		conn->output_te = TE_IDENTITY;
+		headers_remove(req->headers, "transfer-encoding");
+		headers_add_key_val(req->headers, "Connection", "close");
+	}
 
 	outbuf = bufferevent_get_output(conn->bev);
 
@@ -674,11 +750,14 @@ http_conn_write_buf(struct http_conn *conn, struct evbuffer *buf)
 {
 	struct evbuffer *outbuf;
 	
-	// XXX translate input to chunked format if needed
-
 	outbuf = bufferevent_get_output(conn->bev);
 
+	if (conn->output_te == TE_CHUNKED)
+		evbuffer_add_printf("%x\r\n",
+				    (unsigned)evbuffer_get_length(outbuf));
 	evbuffer_add_buffer(outbuf, buf);
+	if (conn->output_te == TE_CHUNKED)
+		evbuffer_add(outbuf, "\r\n", 2);
 
 	/* have we choaked? */	
 	if (evbuffer_get_length(outbuf) > max_write_backlog) {
@@ -689,6 +768,15 @@ http_conn_write_buf(struct http_conn *conn, struct evbuffer *buf)
 	}
 
 	return 1;
+}
+
+void
+http_conn_write_finished(struct http_conn *conn)
+{
+	if (conn->output_te == TE_CHUNKED)
+		bufferevent_write(conn->bev, "0\r\n\r\n", 5);
+	conn->output_te = TE_IDENTITY;
+		
 }
 
 int
@@ -739,25 +827,46 @@ http_conn_flush(struct http_conn *conn)
 		METHOD0(conn, on_flush);
 }
 
+// XXX this should support more descriptive messages
 void
 http_conn_send_error(struct http_conn *conn, int code)
 {
+	char length[64];
+	struct evbuffer *msg;
 	struct http_response resp;
 	struct header_list headers;
 
-	resp.headers = &headers;
-	
-	TAILQ_INIT(headers);
+	assert(conn->type == HTTP_CLIENT);
 
-	headers_add_key(&headers, "Connection");
-	if (conn->state == HTTP_STATE_READ_BODY ||
-	    !conn->persistent) {
-		headers_add_value(&headers, "close");
-	} else {
-		headers_add_value(&headers, "keep-alive");
-	}
-	// XXX
+	TAILQ_INIT(headers);
+	msg = evbuffer_new();
+	resp.headers = &headers;
+
+	resp.te = TE_IDENTITY;
+	resp.vers = HTTP_11;
+	resp.code = code;
+	resp.reason = code_to_reason_string(code);
+
+	evbuffer_printf(msg,
+		"<html>\n"
+		"<head>\n"
+		"<title>%s</title>\n"
+		"</head>\n"
+		"<body>\n"
+		"<h1>%d %s</h1>\n"
+		"</body>\n"
+		"</html>\n",
+		resp.reason, code, resp.reason);
+
+	evutil_snprintf(length, sizeof(length), "%u", 
+		        (unsigned)evbuffer_get_length(msg));
+	headers_add_key_val(&headers, "Content-Type", "text/html");
+	headers_add_key_val(&headers, "Content-Length", length);	
+
+	http_conn_write_response(conn, &resp);
+	http_conn_write_buf(conn, msg);
 	headers_clear(&headers);
+	evbuffer_free(msg);
 }
 
 void

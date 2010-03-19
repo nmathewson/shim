@@ -58,6 +58,7 @@ struct http_request {
 	enum http_method meth;
 	struct url *url;
 	enum http_version vers;
+	enum http_te te;
 	struct header_list *headers;
 };
 TAILQ_HEAD(http_request_list, http_request);
@@ -66,6 +67,7 @@ struct http_response {
 	enum http_version vers;
 	int code;
 	char *reason;
+	enum http_te te;
 	struct header_list *headers;
 };
 
@@ -97,6 +99,7 @@ void http_conn_write_response(struct http_conn *conn, struct http_response *resp
 
 /* return: 0 on choaked, 1 on queued. */
 int http_conn_write_buf(struct http_conn *conn, struct evbuffer *buf);
+void http_conn_write_finished(struct http_conn *conn);
 
 int http_conn_current_message_has_body(struct http_conn *conn);
 void http_conn_set_current_message_bodyless(struct http_conn *conn);

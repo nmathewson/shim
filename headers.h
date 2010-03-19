@@ -23,6 +23,8 @@ struct evbuffer;
 
 void headers_add_key(struct header_list *headers, const char *key, size_t n);
 void headers_add_val(struct header_list *headers, const char *val, size_t n);
+void headers_add_key_val(struct header_list *headers, const char *key,
+			 const char *val);
 void headers_dump(struct header_list *headers, struct evbuffer *buf);
 int headers_load(struct header_list *headers, struct evbuffer *buf);
 char *headers_find(struct header_list *headers, const char *key);

@@ -181,19 +181,11 @@ client_scrub_request(struct client *client, struct http_request *req)
 	if (req->url->port < 0)
 		req->url->port = 80;
 
-	headers_remove(req->headers, "connection");
-
 	return 0;
 
 fail:
 	http_request_free(req);
 	return -1;
-}
-
-static int
-client_scrub_response(struct client *client, struct http_response *resp)
-{
-	headers_remove(req->headers, "connection");
 }
 
 static int
@@ -241,23 +233,27 @@ client_request_serviced(struct client *client)
 	// - if the client's connection isn't persistent, we should terminate the client connection.
 	// - if we expect more reqs on the client connection, start reading again in case we stopped
 	//   earlier.
-	
+
 	req = TAILQ_FIRST(&client->requests);
 	TAILQ_REMOVE(&client->requests, req, next);
 	http_request_free(req);
 	client->nrequests--;
 
-	/* let's try to reuse this server connection */
-	if (http_conn_is_persistent(client->server->conn)) {
-		if (!server_write_client_request(client->server)) {
-			client->server->state = SERVER_STATE_IDLE;
-			TAILQ_INSERT_TAIL(&idle_servers, client->server, next);
-			client->server->client = NULL;
+	if (client->server) {
+		/* let's try to reuse this server connection */
+		if (http_conn_is_persistent(client->server->conn)) {
+			if (!server_write_client_request(client->server)) {
+				client->server->state = SERVER_STATE_IDLE;
+				TAILQ_INSERT_TAIL(&idle_servers,
+						  client->server,
+						  next);
+				client->server->client = NULL;
+				client->server = NULL;
+			}
+		} else {
+			server_free(client->server);
 			client->server = NULL;
 		}
-	} else {
-		server_free(client->server);
-		client->server = NULL;
 	}
 
 	if (!http_conn_is_persistent(client->conn)) {
@@ -274,7 +270,19 @@ client_request_serviced(struct client *client)
 static void
 client_notice_server_failed(struct client *client)
 {
-	// respond with proxy errors for all pending reqs for our active server
+	struct http_request *req;
+	struct server *server = client->server;
+
+	client->server = NULL;
+
+	while ((req = TAILQ_FIRST(&client->requests))) {
+		if (evutil_ascii_strcasecmp(req->url->host, server->host) ||
+		    req->url->port != server->port)
+			break;
+		// XXX need a more descriptive error
+		http_conn_send_error(client->conn, 502);
+		client_request_serviced(client);
+	}
 }
 
 /* http event slots */
@@ -331,7 +339,10 @@ on_client_read_body(struct http_conn *conn, struct evbuffer *buf, void *arg)
 static void
 on_client_msg_complete(struct http_conn *conn, void *arg)
 {
-	// XXX not much to do here?
+	struct client *client = arg;
+
+	if (http_conn_current_message_has_body(conn))
+		http_conn_write_finished(client->server->conn);
 }
 
 static void
@@ -392,10 +403,10 @@ on_server_response(struct http_conn *conn, struct http_response *resp, void *arg
 {
 	struct server *server = arg;
 	
-	// XXX anything we need to do scrub this response?
 	http_conn_write_response(server->client->conn, resp);
 	// XXX maybe not read body on error?
 	// XXX handle expect 100-continue, etc
+
 	client_start_reading_body(server->client);
 }
 
@@ -413,6 +424,8 @@ on_server_msg_complete(struct http_conn *conn, void *arg)
 {
 	struct server *server = arg;
 
+	if (http_conn_current_message_has_body(conn))
+		http_conn_write_finished(server->client->conn);
 	client_request_serviced(server->client);
 }
 

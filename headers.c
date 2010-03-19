@@ -33,6 +33,14 @@ headers_add_val(struct header_list *headers, const char *val, size_t n)
 }
 
 void
+headers_add_key_val(struct header_list *headers, const char *key,
+	const char *val)
+{
+	headers_add_key(key, strlen(key));
+	headers_add_val(val, strlen(val));
+}
+
+void
 headers_dump(struct header_list *headers, struct evbuffer *buf)
 {
 	struct header *h;
