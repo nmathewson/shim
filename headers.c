@@ -36,8 +36,8 @@ void
 headers_add_key_val(struct header_list *headers, const char *key,
 	const char *val)
 {
-	headers_add_key(key, strlen(key));
-	headers_add_val(val, strlen(val));
+	headers_add_key(headers, key, strlen(key));
+	headers_add_val(headers, val, strlen(val));
 }
 
 void
@@ -47,9 +47,10 @@ headers_dump(struct header_list *headers, struct evbuffer *buf)
 	struct val_line *line;
 	
 	TAILQ_FOREACH(h, headers, next) {
-		evbuffer_add_printf(buf, "%s:", h->key);
-		TAILQ_FOREACH(line, &h->val, next)
+		evbuffer_add_printf(buf, "%s: ", h->key);
+		TAILQ_FOREACH(line, &h->val, next) {
 			evbuffer_add_printf(buf, "%s\r\n", line->str);
+		}
 	}
 
 	evbuffer_add(buf, "\r\n", 2);
@@ -71,12 +72,13 @@ headers_load(struct header_list *headers, struct evbuffer *buf)
 
 		if (*line != ' ' && *line != '\t') {
 			p = strchr(line, ':');
-			if (!p) {
+			if (!p || line == p) {
 				mem_free(line);
 				return -1;
 			}
 			headers_add_key(headers, line, p - line);
 			++p;
+			p += strspn(p, " \t");
 		}
 		
 		if (!TAILQ_LAST(headers, header_list)) {
@@ -104,9 +106,7 @@ headers_find(struct header_list *headers, const char *key)
 		if (evutil_ascii_strcasecmp(h->key, key))
 			continue;
 
-		/* calculate total size */
-		TAILQ_FOREACH(line, &h->val, next)
-			len += line->len;
+		len = h->val_len;
 
 		/* XXX Some of this space is wasted if we trim any leading WS
  		   from value lines */

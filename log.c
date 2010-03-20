@@ -67,8 +67,11 @@ log_fatal(const char *msg, ...)
 void
 log_msg_va(enum log_level lvl, const char *msg, va_list ap)
 {
-	if (lvl >= min_log_level)
+	if (lvl >= min_log_level) {
 		vfprintf(log_file, msg, ap);
+		fputs("\n", log_file);
+		fflush(log_file);
+	}
 }
 
 void

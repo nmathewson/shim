@@ -1,3 +1,4 @@
+#include <netinet/in.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
@@ -203,6 +204,38 @@ url_free(struct url *url)
 const char *
 format_addr(const struct sockaddr *addr)
 {
+	const char *r;
+	static char buf[256];
+	char tmp[256];
+
+	if (addr->sa_family == AF_INET) {	
+		struct sockaddr_in *sin = (struct sockaddr_in *)addr;
+		r = evutil_inet_ntop(AF_INET, &sin->sin_addr, tmp,
+		            	     sizeof(tmp));
+		if (r) {
+			if (sin->sin_port)
+				evutil_snprintf(buf, sizeof(buf), "%s:%hu",
+						tmp, ntohs(sin->sin_port));
+			else
+				strcpy(buf, tmp);
+		}
+	} else if (addr->sa_family == AF_INET6) {
+		struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)addr;
+		r = evutil_inet_ntop(AF_INET6, &sin6->sin6_addr, tmp,
+				     sizeof(tmp));
+		if (r) {
+			if (sin6->sin6_port)
+				evutil_snprintf(buf, sizeof(buf), "[%s]:%hu",
+						tmp, ntohs(sin6->sin6_port));
+			else
+				strcpy(buf, tmp);
+		}
+	}
+
+	if (!r)
+		strcpy(buf, "???");
+	
+	return buf;
 }
 
 const char *
@@ -217,15 +250,12 @@ socket_error_string(evutil_socket_t s)
 
 int main(int argc, char **argv)
 {
-	struct url *url;
+	struct sockaddr_storage ss;
+	int len = sizeof(ss);
 
-	url = url_tokenize(argv[1]);
-	if (url) {
-		printf("%s://%s:%d%s\n", url->scheme, url->host, url->port, url->query);
-		url_free(url);
-	} else {
-		printf("BAD URL!\n");
-	}
+	if (evutil_parse_sockaddr_port(argv[1], &ss, &len) < 0)
+		return 0;
+	printf("ur addr: %s\n", format_addr((struct sockaddr *)&ss));
 	
 	return 0;
 }

@@ -112,7 +112,8 @@ void http_conn_start_reading(struct http_conn *conn);
 
 void http_conn_flush(struct http_conn *conn);
 
-void http_conn_send_error(struct http_conn *conn, int code);
+void http_conn_send_error(struct http_conn *conn, int code,
+			  const char *fmt, ...);
 
 void http_request_free(struct http_request *req);
 void http_response_free(struct http_response *req);

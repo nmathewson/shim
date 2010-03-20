@@ -1,8 +1,11 @@
 #include <sys/queue.h>
+#include <assert.h>
 #include <event2/event.h>
 #include <event2/listener.h>
 #include "proxy.h"
 #include "httpconn.h"
+#include "util.h"
+#include "log.h"
 
 enum server_state {
 	SERVER_STATE_INITIAL,
@@ -30,7 +33,7 @@ enum client_state {
 
 struct client {
 	enum client_state state;
-	struct server_list requests;
+	struct http_request_list requests;
 	size_t nrequests;
 	struct http_conn *conn;
 	struct server *server;
@@ -41,6 +44,7 @@ static void on_client_request(struct http_conn *, struct http_request *, void *)
 static void on_client_read_body(struct http_conn *, struct evbuffer *, void *);
 static void on_client_msg_complete(struct http_conn *, void *);
 static void on_client_write_more(struct http_conn *, void *);
+static void on_client_flush(struct http_conn *, void *);
 
 static void on_server_connected(struct http_conn *, void *);
 static void on_server_error(struct http_conn *, enum http_conn_error, void *);
@@ -48,6 +52,7 @@ static void on_server_response(struct http_conn *, struct http_response *, void 
 static void on_server_read_body(struct http_conn *, struct evbuffer *, void *);
 static void on_server_msg_complete(struct http_conn *, void *);
 static void on_server_write_more(struct http_conn *, void *);
+static void on_server_flush(struct http_conn *, void *);
 
 static const struct http_cbs client_methods = {
 	0,
@@ -74,17 +79,18 @@ static const struct http_cbs server_methods = {
 static struct event_base *proxy_event_base;
 static struct evdns_base *proxy_evdns_base;
 static struct evconnlistener *listener = NULL;
-static struct server_list idle_servers = TAILQ_HEAD_INITIALIZER(&idle_servers);
+static struct server_list idle_servers;
 static size_t max_pending_requests = 8;
 
 static struct server *
-server_new(const char *host, int port)
+server_new(const char *host, int port, struct client *client)
 {
 	struct server *server;
 
 	server = mem_calloc(1, sizeof(*server));
 	server->host = mem_strdup(host);
 	server->port = port;
+	server->client = client;
 	server->conn = http_conn_new(proxy_event_base, -1, HTTP_SERVER,
 				&server_methods, server);
 
@@ -154,7 +160,7 @@ client_free(struct client *client)
 		return;
 
 	while ((req = TAILQ_FIRST(&client->requests))) {
-		TAILQ_REMOVE(req, &client->requests, next);
+		TAILQ_REMOVE(&client->requests, req, next);
 		http_request_free(req);
 	}
 
@@ -170,11 +176,11 @@ client_scrub_request(struct client *client, struct http_request *req)
 	// XXX remove proxy auth msgs?
 	
 	if (!req->url->host) {
-		http_conn_send_error(client->conn, 401);
+		http_conn_send_error(client->conn, 403, "Forbidden");
 		goto fail;
 	}
 	if (evutil_ascii_strcasecmp(req->url->scheme, "http")) {
-		http_conn_send_error(client->conn, 400);
+		http_conn_send_error(client->conn, 400, "Invalid URL");
 		goto fail;
 	}
 
@@ -201,14 +207,15 @@ client_associate_server(struct client *client, const struct url *url)
 		if (!evutil_ascii_strcasecmp(it->host, url->host) &&
 		    it->port == url->port) {
 			TAILQ_REMOVE(&idle_servers, it, next);
+			assert(it->client == NULL);
 			client->server = it;
+			it->client = client;
 			return 0;
 		}
 	}
 
 	/* we didn't find one. lets setup a new one. */
-	client->server = server_new(url->host, url->port);
-	server->client = client;
+	client->server = server_new(url->host, url->port, client);
 
 	return server_connect(client->server);	
 }
@@ -226,7 +233,7 @@ client_request_serviced(struct client *client)
 {
 	struct http_request *req;
 
-	assert(client->nrequests > 0)
+	assert(client->nrequests > 0);
 
 	// - pop the first req on our req list
 	// - if the server's connection isn't persistent, we should terminate the server connection.
@@ -258,7 +265,7 @@ client_request_serviced(struct client *client)
 
 	if (!http_conn_is_persistent(client->conn)) {
 		// XXX maybe shutdown the socket?
-		client->state = STATE_CLIENT_CLOSING;
+		client->state = CLIENT_STATE_CLOSING;
 		http_conn_stop_reading(client->conn);
 		http_conn_flush(client->conn);
 	} else if (!http_conn_current_message_has_body(client->conn) &&
@@ -279,8 +286,8 @@ client_notice_server_failed(struct client *client)
 		if (evutil_ascii_strcasecmp(req->url->host, server->host) ||
 		    req->url->port != server->port)
 			break;
-		// XXX need a more descriptive error
-		http_conn_send_error(client->conn, 502);
+		http_conn_send_error(client->conn, 502,
+				     "Server connection failed");
 		client_request_serviced(client);
 	}
 }
@@ -291,7 +298,7 @@ static void
 on_client_error(struct http_conn *conn, enum http_conn_error err, void *arg)
 {
 	// what can we do here?
-	log_warn("proxy: client connection failed.");
+	log_warn("proxy: client connection failed");
 	client_free(arg);
 }
 
@@ -320,6 +327,10 @@ on_client_request(struct http_conn *conn, struct http_request *req, void *arg)
 	if (++client->nrequests > max_pending_requests ||
 	    http_conn_current_message_has_body(conn))
 		http_conn_stop_reading(conn);
+
+	log_debug("proxy: new request for %s:%d%s (pipeline %u)",
+		  req->url->host, req->url->port, req->url->query,
+		  (unsigned)client->nrequests);
 
 	if (!client->server && client_associate_server(client, req->url) < 0)
 		return;
@@ -407,7 +418,7 @@ on_server_response(struct http_conn *conn, struct http_response *resp, void *arg
 	// XXX maybe not read body on error?
 	// XXX handle expect 100-continue, etc
 
-	client_start_reading_body(server->client);
+	client_start_reading_request_body(server->client);
 }
 
 static void
@@ -467,28 +478,22 @@ proxy_client_get_max_pending_requests(void)
 }
 
 int
-proxy_init(const struct sockaddr *listen_here, int socklen)
+proxy_init(struct event_base *base, struct evdns_base *dns,
+	   const struct sockaddr *listen_here, int socklen)
 {
-	struct evconlistener *lcs = NULL;
-	struct event_base *base = NULL;
-	struct evdns_base *dns = NULL;
+	struct evconnlistener *lcs = NULL;
 
-	base = event_base_new();
-	if (!base)
-		goto fail;
+	TAILQ_INIT(&idle_servers);
 
-	dns = evdns_base_new(base, 1);
-	if (!dns)
-		goto fail;
-
-	lcs = evconnlistener_new_bind(base, client_accept, NULL, CLOSE_ON_FREE,
-					-1, listen_here, len);
+	lcs = evconnlistener_new_bind(base, client_accept, NULL,
+				      LEV_OPT_CLOSE_ON_FREE,
+				      -1, listen_here, socklen);
 
 	if (!lcs) {
 		log_error("proxy: couldn't listen on %s: %s",
 			  format_addr(listen_here),
 			  socket_error_string(-1));
-		goto fail;
+		return -1;
 	}
 	
 	listener = lcs;
@@ -497,15 +502,6 @@ proxy_init(const struct sockaddr *listen_here, int socklen)
 
 	return 0;
 
-fail:
-	if (ecs)
-		evconlistener_free(ecs);
-	if (dns)
-		evdns_base_free(dns, 0);
-	if (base)
-		event_base_free(base);
-
-	return -1;
 }
 
 void

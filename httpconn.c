@@ -37,6 +37,7 @@ struct http_conn {
 	enum http_version vers;
 	enum http_te te;
 	enum http_type type;
+	enum http_te output_te;
 	int is_choaked;
 	int has_body;
 	int read_paused;
@@ -47,6 +48,7 @@ struct http_conn {
 	ev_int64_t data_remaining;
 	char *firstline;
 	struct header_list *headers;
+	struct event_base *base;
 	struct bufferevent *bev;
 	struct evbuffer *inbuf_processed;
 };
@@ -201,7 +203,7 @@ begin_message(struct http_conn *conn)
 	conn->headers = mem_calloc(1, sizeof(*conn->headers));
 	TAILQ_INIT(conn->headers);
 	conn->state = HTTP_STATE_IDLE;
-	bufferevent_enable(conn->bev, EV_WRITE | EV_READ);
+	bufferevent_enable(conn->bev, EV_READ);
 }
 
 static void
@@ -214,7 +216,7 @@ end_message(struct http_conn *conn, enum http_conn_error err)
 
 	if (err != ERROR_NONE || !conn->persistent) {
 		conn->state = HTTP_STATE_MANGLED;
-		bufferevent_disable(conn->bev, EV_WRITE | EV_READ);
+		bufferevent_disable(conn->bev, EV_READ);
 	} else
 		begin_message(conn);
 
@@ -339,33 +341,36 @@ static void
 read_chunk(struct http_conn *conn)
 {
 	struct evbuffer *inbuf = bufferevent_get_input(conn->bev);
-	size_t len = evbuffer_get_length(inbuf);
+	size_t len;
 	char *line;
-
-	if (conn->data_remaining < 0) {
-		if (parse_chunk_len(conn) < 0)
-			end_message(conn, ERROR_CHUNK_PARSE_FAILED);
-	} else if (conn->data_remaining == 0) {
-		line = evbuffer_readln(inbuf, NULL, EVBUFFER_EOL_CRLF);
-		if (line) {
-			/* XXX doesn't handle trailers */
-			if (*line != '\0')
-				log_warn("http_conn: garbage after last chunk");
-			mem_free(line);		
-			end_message(conn, ERROR_NONE);
+	
+	while ((len = evbuffer_get_length(inbuf)) > 0) {
+		if (conn->data_remaining < 0) {
+			if (parse_chunk_len(conn) < 0) {
+				end_message(conn, ERROR_CHUNK_PARSE_FAILED);
+				return;
+			}
+		} else if (conn->data_remaining == 0) {
+			line = evbuffer_readln(inbuf, NULL, EVBUFFER_EOL_CRLF);
+			if (line) {
+				/* XXX doesn't handle trailers */
+				mem_free(line);		
+				end_message(conn, ERROR_NONE);
+			}
 			return;
+		} else {
+			/* XXX should mind potential overflow */
+			if (len >= (size_t)conn->data_remaining)
+				len = (size_t)conn->data_remaining;
+
+			evbuffer_remove_buffer(inbuf, conn->inbuf_processed,
+					       len);
+			METHOD1(conn, on_read_body, conn->inbuf_processed);
+			conn->data_remaining -= len;
+
+			if (conn->data_remaining == 0)
+				conn->data_remaining = -1;
 		}
-	} else {
-		/* XXX should mind potential overflow */
-		if (len >= (size_t)conn->data_remaining)
-			len = (size_t)conn->data_remaining;
-
-		evbuffer_remove_buffer(inbuf, conn->inbuf_processed, len);
-		METHOD1(conn, on_read_body, conn->inbuf_processed);
-		conn->data_remaining -= len;
-
-		if (conn->data_remaining == 0)
-			conn->data_remaining = -1;
 	}
 }
 
@@ -477,7 +482,7 @@ check_headers(struct http_conn *conn, struct http_request *req,
 	if (persistent) {
 		val = headers_find(conn->headers, "connection");
 		if (val) {
-			if (evutil_ascii_strcasecmp(val, "close"))
+			if (!evutil_ascii_strcasecmp(val, "close"))
 				persistent = 0;
 			mem_free(val);
 		}
@@ -592,7 +597,7 @@ http_errorcb(struct bufferevent *bev, short what, void *_conn)
 }
 
 static void
-process_one_message(struct http_conn *conn)
+process_one_step(struct http_conn *conn)
 {
 	struct evbuffer *inbuf = bufferevent_get_input(conn->bev);
 
@@ -603,7 +608,8 @@ process_one_message(struct http_conn *conn)
 		/* fallthru... */
 	case HTTP_STATE_READ_FIRSTLINE:
 		assert(conn->firstline == NULL);
-		conn->firstline = evbuffer_readln(inbuf, NULL, EVBUFFER_EOL_CRLF);
+		conn->firstline = evbuffer_readln(inbuf, NULL,
+						  EVBUFFER_EOL_CRLF);
 		if (conn->firstline)
 			conn->state = HTTP_STATE_READ_HEADERS;
 		break;	
@@ -622,11 +628,14 @@ static void
 process_inbuf(struct http_conn *conn)
 {
 	struct evbuffer *inbuf = bufferevent_get_input(conn->bev);
+	enum http_state state_before;
 
 	do {
-		process_one_message(conn);
+		state_before = conn->state;
+		process_one_step(conn);
 	} while (!conn->read_paused &&
-		 evbuffer_get_length(inbuf) > 0);
+		 evbuffer_get_length(inbuf) > 0 &&
+		 state_before != conn->state);
 }
 
 static void
@@ -656,6 +665,7 @@ http_conn_new(struct event_base *base, evutil_socket_t sock,
 	struct http_conn *conn;
 
 	conn = mem_calloc(1, sizeof(*conn));
+	conn->base = base;
 	conn->type = type;
 	conn->cbs = cbs;
 	conn->cbarg = cbarg;
@@ -687,12 +697,20 @@ http_conn_connect(struct http_conn *conn, struct evdns_base *dns,
 					    	   host, port);	
 }
 
-void
-http_conn_free(struct http_conn *conn)
+static void
+deferred_free(evutil_socket_t s, short what, void *arg)
 {
+	struct http_conn *conn = arg;
 	bufferevent_free(conn->bev);
 	evbuffer_free(conn->inbuf_processed);
 	mem_free(conn);
+}
+
+void
+http_conn_free(struct http_conn *conn)
+{
+	http_conn_stop_reading(conn);
+	event_base_once(conn->base, -1, EV_TIMEOUT, deferred_free, conn, NULL);
 }
 
 void
@@ -725,14 +743,14 @@ http_conn_write_response(struct http_conn *conn, struct http_response *resp)
 	assert(conn->type == HTTP_CLIENT);
 	assert(conn->vers != HTTP_UNKNOWN);
 
-	headers_remove(req->headers, "connection");
+	headers_remove(resp->headers, "connection");
 	resp->vers = conn->vers;
 
 	conn->output_te = resp->te;
 	if (conn->vers == HTTP_10) {
 		conn->output_te = TE_IDENTITY;
-		headers_remove(req->headers, "transfer-encoding");
-		headers_add_key_val(req->headers, "Connection", "close");
+		headers_remove(resp->headers, "transfer-encoding");
+		headers_add_key_val(resp->headers, "Connection", "close");
 	}
 
 	outbuf = bufferevent_get_output(conn->bev);
@@ -753,8 +771,8 @@ http_conn_write_buf(struct http_conn *conn, struct evbuffer *buf)
 	outbuf = bufferevent_get_output(conn->bev);
 
 	if (conn->output_te == TE_CHUNKED)
-		evbuffer_add_printf("%x\r\n",
-				    (unsigned)evbuffer_get_length(outbuf));
+		evbuffer_add_printf(outbuf, "%x\r\n",
+				    (unsigned)evbuffer_get_length(buf));
 	evbuffer_add_buffer(outbuf, buf);
 	if (conn->output_te == TE_CHUNKED)
 		evbuffer_add(outbuf, "\r\n", 2);
@@ -820,16 +838,15 @@ http_conn_start_reading(struct http_conn *conn)
 void
 http_conn_flush(struct http_conn *conn)
 {
-	struct evbuffer *outbuf = bufferevent_get_outbuf(conn->bev);
+	struct evbuffer *outbuf = bufferevent_get_output(conn->bev);
 
 	// XXX this might cause recursion
 	if (evbuffer_get_length(outbuf) == 0)
 		METHOD0(conn, on_flush);
 }
 
-// XXX this should support more descriptive messages
 void
-http_conn_send_error(struct http_conn *conn, int code)
+http_conn_send_error(struct http_conn *conn, int code, const char *fmt, ...)
 {
 	char length[64];
 	struct evbuffer *msg;
@@ -838,30 +855,34 @@ http_conn_send_error(struct http_conn *conn, int code)
 
 	assert(conn->type == HTTP_CLIENT);
 
-	TAILQ_INIT(headers);
+	TAILQ_INIT(&headers);
 	msg = evbuffer_new();
 	resp.headers = &headers;
 
 	resp.te = TE_IDENTITY;
 	resp.vers = HTTP_11;
 	resp.code = code;
-	resp.reason = code_to_reason_string(code);
+	resp.reason = (char*)error_code_to_reason_string(code);
 
-	evbuffer_printf(msg,
+	// XXX do something with fmt. make it html friendly
+	evbuffer_add_printf(msg,
 		"<html>\n"
 		"<head>\n"
-		"<title>%s</title>\n"
+		"<title>%d %s</title>\n"
 		"</head>\n"
 		"<body>\n"
 		"<h1>%d %s</h1>\n"
 		"</body>\n"
 		"</html>\n",
-		resp.reason, code, resp.reason);
+		code, resp.reason, code, resp.reason);
 
 	evutil_snprintf(length, sizeof(length), "%u", 
 		        (unsigned)evbuffer_get_length(msg));
 	headers_add_key_val(&headers, "Content-Type", "text/html");
 	headers_add_key_val(&headers, "Content-Length", length);	
+	headers_add_key_val(&headers, "Expires", "0");
+	headers_add_key_val(&headers, "Cache-Control", "no-cache");
+	headers_add_key_val(&headers, "Pragma", "no-cache");
 
 	http_conn_write_response(conn, &resp);
 	http_conn_write_buf(conn, msg);
@@ -890,6 +911,7 @@ http_response_free(struct http_response *resp)
 #include <netinet/in.h>
 #include <stdio.h>
 #include <event2/dns.h>
+#include <event2/listener.h>
 
 static void
 proxy_connected(struct http_conn *conn, void *arg)
@@ -917,6 +939,25 @@ proxy_error(struct http_conn *conn, enum http_conn_error err, void *arg)
 {
 	fprintf(stderr, "error %d\n", err);
 	http_conn_free(conn);
+}
+
+static void
+proxy_request(struct http_conn *conn, struct http_request *req, void *arg)
+{
+	struct evbuffer *buf;
+
+	fprintf(stderr, "request: %s %s %s\n",
+			method_to_string(req->meth),
+			req->url->query,
+			version_to_string(req->vers));
+
+	buf = evbuffer_new();
+	headers_dump(req->headers, buf);
+	fwrite(evbuffer_pullup(buf, evbuffer_get_length(buf)), evbuffer_get_length(buf), 1, stderr);
+	evbuffer_free(buf);
+
+
+	http_conn_send_error(conn, 401);
 }
 
 static void
@@ -954,15 +995,32 @@ proxy_write_more(struct http_conn *conn, void *arg)
 {
 }
 
+static void
+proxy_flush(struct http_conn *conn, void *arg)
+{
+	fprintf(stderr, "\n....FLUSHED...\n");
+}
+
 static struct http_cbs test_proxy_cbs = {
 	proxy_connected,
 	proxy_error,
-	0,
+	proxy_request,
 	proxy_response,
 	proxy_read_body,
 	proxy_msg_complete,
-	proxy_write_more
+	proxy_write_more,
+	proxy_flush
 };
+
+
+static void
+clientcb(struct evconnlistener *ecs, evutil_socket_t s,
+              struct sockaddr *addr, int len, void *arg) 
+{
+	struct http_conn *client;
+
+	client = http_conn_new(evconnlistener_get_base(ecs), s, HTTP_CLIENT, &test_proxy_cbs, arg);
+}
 
 int
 main(int argc, char **argv)
@@ -972,6 +1030,20 @@ main(int argc, char **argv)
 	struct http_conn *http;
 	struct url *url;
 
+	base = event_base_new();
+
+	if (argc < 2) {
+		struct evconnlistener *ecs;
+		struct sockaddr_in sin;
+		memset(&sin, 0, sizeof(sin));
+		sin.sin_family=AF_INET;
+		sin.sin_port = htons(8080);
+		ecs = evconnlistener_new_bind(base, clientcb, NULL, 0,
+						LEV_OPT_REUSEABLE, &sin, sizeof(sin));
+		event_base_dispatch(base);
+		return 0;
+	}
+
 	url = url_tokenize(argv[1]);
 	if (!url)
 		return 0;
@@ -979,7 +1051,6 @@ main(int argc, char **argv)
 	if (url->port < 0)
 		url->port = 80;
 
-	base = event_base_new();
 	dns = evdns_base_new(base, 1);
 
 	http = http_conn_new(base, -1, HTTP_SERVER, &test_proxy_cbs, url);
