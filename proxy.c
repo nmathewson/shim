@@ -1,10 +1,12 @@
 #include <sys/queue.h>
 #include <assert.h>
+#include <string.h>
 #include <event2/event.h>
 #include <event2/listener.h>
 #include "proxy.h"
 #include "httpconn.h"
 #include "util.h"
+#include "headers.h"
 #include "log.h"
 
 enum server_state {
@@ -112,7 +114,7 @@ static int
 server_connect(struct server *server)
 {
 	server->state = SERVER_STATE_CONNECTING;
-	return http_conn_connect(server->conn, proxy_evdns_base, AF_UNSPEC,
+	return http_conn_connect(server->conn, proxy_evdns_base, AF_INET,
 				 server->host, server->port);
 }
 
@@ -172,9 +174,6 @@ client_free(struct client *client)
 static int
 client_scrub_request(struct client *client, struct http_request *req)
 {
-	// prune headers; verify that req contains a host to connect to
-	// XXX remove proxy auth msgs?
-	
 	if (!req->url->host) {
 		http_conn_send_error(client->conn, 403, "Forbidden");
 		goto fail;
@@ -187,6 +186,18 @@ client_scrub_request(struct client *client, struct http_request *req)
 	if (req->url->port < 0)
 		req->url->port = 80;
 
+	if (!headers_has_key(req->headers, "Host")) {
+		char *host;
+		size_t len = strlen(req->url->host) + 6;
+		host = mem_calloc(1, len);
+		evutil_snprintf(host, len, "%s:%d", req->url->host,
+				req->url->port);
+		headers_add_key_val(req->headers, "Host", host);
+		mem_free(host);	
+	}
+
+	// XXX remove proxy auth msgs?
+
 	return 0;
 
 fail:
@@ -195,11 +206,18 @@ fail:
 }
 
 static int
-client_associate_server(struct client *client, const struct url *url)
+client_associate_server(struct client *client)
 {
 	struct server *it;
+	struct url *url;
 
 	assert(client->server == NULL);
+
+	if (client->nrequests == 0)
+		return 0;
+
+	url = TAILQ_FIRST(&client->requests)->url;
+
 	assert(url->host != NULL && url->port > 0);
 
 	/* try to find an idle server */
@@ -234,12 +252,6 @@ client_request_serviced(struct client *client)
 	struct http_request *req;
 
 	assert(client->nrequests > 0);
-
-	// - pop the first req on our req list
-	// - if the server's connection isn't persistent, we should terminate the server connection.
-	// - if the client's connection isn't persistent, we should terminate the client connection.
-	// - if we expect more reqs on the client connection, start reading again in case we stopped
-	//   earlier.
 
 	req = TAILQ_FIRST(&client->requests);
 	TAILQ_REMOVE(&client->requests, req, next);
@@ -332,7 +344,7 @@ on_client_request(struct http_conn *conn, struct http_request *req, void *arg)
 		  req->url->host, req->url->port, req->url->query,
 		  (unsigned)client->nrequests);
 
-	if (!client->server && client_associate_server(client, req->url) < 0)
+	if (!client->server && client_associate_server(client) < 0)
 		return;
 
 	server_write_client_request(client->server);
@@ -410,7 +422,8 @@ on_server_error(struct http_conn *conn, enum http_conn_error err, void *arg)
 }
 
 static void
-on_server_response(struct http_conn *conn, struct http_response *resp, void *arg)
+on_server_response(struct http_conn *conn, struct http_response *resp,
+		   void *arg)
 {
 	struct server *server = arg;
 	
@@ -486,7 +499,8 @@ proxy_init(struct event_base *base, struct evdns_base *dns,
 	TAILQ_INIT(&idle_servers);
 
 	lcs = evconnlistener_new_bind(base, client_accept, NULL,
-				      LEV_OPT_CLOSE_ON_FREE,
+				      LEV_OPT_CLOSE_ON_FREE |
+				      LEV_OPT_REUSEABLE,
 				      -1, listen_here, socklen);
 
 	if (!lcs) {

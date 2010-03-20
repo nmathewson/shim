@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include "log.h"
 
 static enum log_level min_log_level = LOG_NOTICE;
@@ -71,6 +72,8 @@ log_msg_va(enum log_level lvl, const char *msg, va_list ap)
 		vfprintf(log_file, msg, ap);
 		fputs("\n", log_file);
 		fflush(log_file);
+		if (lvl >= LOG_FATAL)
+			abort();
 	}
 }
 

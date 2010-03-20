@@ -27,6 +27,7 @@ void headers_add_key_val(struct header_list *headers, const char *key,
 			 const char *val);
 void headers_dump(struct header_list *headers, struct evbuffer *buf);
 int headers_load(struct header_list *headers, struct evbuffer *buf);
+int headers_has_key(struct header_list *headers, const char *key);
 char *headers_find(struct header_list *headers, const char *key);
 int headers_remove(struct header_list *headers, const char *key);
 void headers_clear(struct header_list *headers);

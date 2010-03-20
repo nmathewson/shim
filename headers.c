@@ -93,6 +93,19 @@ headers_load(struct header_list *headers, struct evbuffer *buf)
 	return 0;
 }
 
+int
+headers_has_key(struct header_list *headers, const char *key)
+{
+	struct header *h;
+
+	TAILQ_FOREACH(h, headers, next) {
+		if (!evutil_ascii_strcasecmp(h->key, key))
+			return 1;
+	}
+
+	return 0;
+}
+
 /* caller must free result; returns NULL if key not found. */
 char *
 headers_find(struct header_list *headers, const char *key)
