@@ -95,6 +95,8 @@ server_new(const char *host, int port, struct client *client)
 	server->client = client;
 	server->conn = http_conn_new(proxy_event_base, -1, HTTP_SERVER,
 				&server_methods, server);
+	log_debug("proxy: new server: %p, %s:%d",
+		  server, server->host, server->port);
 
 	return server;
 }
@@ -102,8 +104,19 @@ server_new(const char *host, int port, struct client *client)
 static void
 server_free(struct server *server)
 {
+	struct server *tmp;
+
 	if (!server)
 		return;
+
+	log_debug("proxy: freeing server: %p, %s:%d",
+		  server, server->host, server->port);
+
+	TAILQ_FOREACH(tmp, &idle_servers, next) {
+		if (tmp == server)
+			log_fatal("proxy: idle server %p still queued!",
+				  server);
+	}
 
 	mem_free(server->host);
 	http_conn_free(server->conn);
@@ -114,6 +127,9 @@ static int
 server_connect(struct server *server)
 {
 	server->state = SERVER_STATE_CONNECTING;
+	log_debug("proxy: server %p, %s:%d connecting",
+		  server, server->host, server->port);
+	// XXX AF_UNSPEC seems to cause crashes w/ IPv6 queries
 	return http_conn_connect(server->conn, proxy_evdns_base, AF_INET,
 				 server->host, server->port);
 }
@@ -132,6 +148,11 @@ server_write_client_request(struct server *server)
 	/* it might be nice to support pipelining... */
 	if (!evutil_ascii_strcasecmp(server->host, req->url->host) &&
 	    server->port == req->url->port) {
+		log_debug("proxy: writing %s request for %s from client %p to "
+			  "server %p, %s:%d", 
+			  http_method_to_string(req->meth),
+			  req->url->path, server->client, server,
+			  server->host, server->port);
 		http_conn_write_request(server->conn, req);
 		server->state = SERVER_STATE_REQUEST_SENT;
 		return 1;
@@ -150,6 +171,8 @@ client_new(evutil_socket_t sock)
 	client->conn = http_conn_new(proxy_event_base, sock, HTTP_CLIENT,
 				&client_methods, client);
 
+	log_debug("proxy: new client %p", client);
+
 	return client;
 }
 
@@ -160,6 +183,8 @@ client_free(struct client *client)
 
 	if (!client)
 		return;
+
+	log_debug("proxy: freeing client: %p", client);
 
 	while ((req = TAILQ_FIRST(&client->requests))) {
 		TAILQ_REMOVE(&client->requests, req, next);
@@ -228,6 +253,8 @@ client_associate_server(struct client *client)
 			assert(it->client == NULL);
 			client->server = it;
 			it->client = client;
+			log_debug("proxy: idle server %p, %s:%d associated to "
+				  "client %p", it, it->host, it->port, client);
 			return 0;
 		}
 	}
@@ -241,9 +268,38 @@ client_associate_server(struct client *client)
 static void
 client_start_reading_request_body(struct client *client)
 {
+	//XXX make sure server knows what transefer encodign to use.
 	if (http_conn_current_message_has_body(client->conn) &&
 	    client->nrequests == 1)
 		http_conn_start_reading(client->conn);
+}
+
+static void
+client_write_response(struct client *client, struct http_response *resp)
+{
+	struct http_request *req;
+
+	req = TAILQ_FIRST(&client->requests);
+	assert(req != NULL);
+
+	log_debug("proxy: got response for %s %s %s from %p, %s:%d: %s %d %s",
+		  http_method_to_string(req->meth),
+		  req->url->path,
+		  http_version_to_string(req->vers),
+		  client->server, client->server->host, client->server->port,
+		  http_version_to_string(resp->vers), resp->code,
+		  resp->reason);
+
+	if (req->meth == METH_HEAD)
+		http_conn_set_current_message_bodyless(client->server->conn);
+
+	http_conn_set_output_encoding(client->conn, TE_IDENTITY);
+	if (http_conn_current_message_has_body(client->server->conn) &&
+	    http_conn_is_persistent(client->conn) &&
+	    http_conn_get_current_message_body_length(client->server->conn) < 0)
+		http_conn_set_output_encoding(client->conn, TE_CHUNKED);
+	
+	http_conn_write_response(client->conn, resp);
 }
 
 static void
@@ -251,9 +307,11 @@ client_request_serviced(struct client *client)
 {
 	struct http_request *req;
 
-	assert(client->nrequests > 0);
-
 	req = TAILQ_FIRST(&client->requests);
+	assert(req && client->nrequests > 0);
+	log_debug("proxy: request for client %p, %s %s %s serviced",
+		  client, http_method_to_string(req->meth), req->url->path,
+		  http_version_to_string(req->vers));
 	TAILQ_REMOVE(&client->requests, req, next);
 	http_request_free(req);
 	client->nrequests--;
@@ -309,8 +367,12 @@ client_notice_server_failed(struct client *client)
 static void
 on_client_error(struct http_conn *conn, enum http_conn_error err, void *arg)
 {
-	// what can we do here?
-	log_warn("proxy: client connection failed");
+	if (err == ERROR_IDLE_CONN_TIMEDOUT) {
+		log_info("proxy: closing idle client connection.");
+	} else {
+		log_warn("proxy: client error: %s",
+			 http_conn_error_to_string(err));
+	}
 	client_free(arg);
 }
 
@@ -340,8 +402,9 @@ on_client_request(struct http_conn *conn, struct http_request *req, void *arg)
 	    http_conn_current_message_has_body(conn))
 		http_conn_stop_reading(conn);
 
-	log_debug("proxy: new request for %s:%d%s (pipeline %u)",
-		  req->url->host, req->url->port, req->url->query,
+	log_debug("proxy: new %s request for %s:%d%s (pipeline %u)",
+		  http_method_to_string(req->meth),
+		  req->url->host, req->url->port, req->url->path,
 		  (unsigned)client->nrequests);
 
 	if (!client->server && client_associate_server(client) < 0)
@@ -393,6 +456,8 @@ on_server_connected(struct http_conn *conn, void *arg)
 
 	assert(server->state == SERVER_STATE_CONNECTING);
 	server->state = SERVER_STATE_CONNECTED;
+	log_debug("proxy: server %p, %s:%d finished connecting",
+		  server, server->host, server->port);
 	server_write_client_request(server);
 }
 
@@ -407,15 +472,27 @@ on_server_error(struct http_conn *conn, enum http_conn_error err, void *arg)
 	case SERVER_STATE_REQUEST_SENT:
 		// XXX if we haven't serviced any reqs on this server yet,
 		//     we should try resending the first request
+		if (err == ERROR_CONNECT_FAILED) {
+			assert(server->state == SERVER_STATE_CONNECTING);
+			log_socket_error("proxy: connection to %s:%d failed",
+					 log_scrub(server->host), server->port);
+		} else {
+			log_error("proxy: error while communicating with "
+				  "%s:%d: %s", log_scrub(server->host),
+				  server->port,
+				  http_conn_error_to_string(err));
+		}
 		assert(server->client != NULL);
 		client_notice_server_failed(server->client);
 		break;
 	case SERVER_STATE_IDLE:
 		assert(server->client == NULL);
 		TAILQ_REMOVE(&idle_servers, server, next);
+		log_debug("proxy: idle server %p, %s:%d timedout",
+			  server, server->host, server->port);
 		break;
 	default:
-		log_fatal("server: error cb called in invalid state");
+		log_fatal("proxy: error cb called in invalid state");
 	}
 
 	server_free(server);
@@ -426,12 +503,20 @@ on_server_response(struct http_conn *conn, struct http_response *resp,
 		   void *arg)
 {
 	struct server *server = arg;
-	
-	http_conn_write_response(server->client->conn, resp);
+
+	client_write_response(server->client, resp);
+
+	if (http_conn_current_message_has_body(conn))
+		log_debug("proxy: will copy body from server %p to client %p",
+			  server, server->client);
+
+
 	// XXX maybe not read body on error?
 	// XXX handle expect 100-continue, etc
 
 	client_start_reading_request_body(server->client);
+
+	http_response_free(resp);
 }
 
 static void
@@ -472,7 +557,11 @@ client_accept(struct evconnlistener *ecs, evutil_socket_t s,
 {
 	struct client *client;
 
+	log_info("proxy: new client connection from %s",
+		 format_addr(addr));
+
 	client = client_new(s);
+
 	// XXX do we want to keep track of the client obj somehow?
 }
 
@@ -504,9 +593,8 @@ proxy_init(struct event_base *base, struct evdns_base *dns,
 				      -1, listen_here, socklen);
 
 	if (!lcs) {
-		log_error("proxy: couldn't listen on %s: %s",
-			  format_addr(listen_here),
-			  socket_error_string(-1));
+		log_socket_error("proxy: couldn't listen on %s",
+				 format_addr(listen_here));
 		return -1;
 	}
 	

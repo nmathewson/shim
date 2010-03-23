@@ -58,7 +58,6 @@ struct http_request {
 	enum http_method meth;
 	struct url *url;
 	enum http_version vers;
-	enum http_te te;
 	struct header_list *headers;
 };
 TAILQ_HEAD(http_request_list, http_request);
@@ -67,7 +66,6 @@ struct http_response {
 	enum http_version vers;
 	int code;
 	char *reason;
-	enum http_te te;
 	struct header_list *headers;
 };
 
@@ -104,6 +102,9 @@ void http_conn_write_finished(struct http_conn *conn);
 int http_conn_current_message_has_body(struct http_conn *conn);
 void http_conn_set_current_message_bodyless(struct http_conn *conn);
 
+enum http_te http_conn_get_current_message_body_encoding(struct http_conn *conn);
+ev_int64_t http_conn_get_current_message_body_length(struct http_conn *conn);
+void http_conn_set_output_encoding(struct http_conn *conn, enum http_te te);
 int http_conn_is_persistent(struct http_conn *conn);
 
 /* turn read off/on; useful for when the other end is choking */
@@ -114,6 +115,10 @@ void http_conn_flush(struct http_conn *conn);
 
 void http_conn_send_error(struct http_conn *conn, int code,
 			  const char *fmt, ...);
+
+const char *http_conn_error_to_string(enum http_conn_error err);
+const char *http_method_to_string(enum http_method m);
+const char *http_version_to_string(enum http_version v);
 
 void http_request_free(struct http_request *req);
 void http_response_free(struct http_response *req);

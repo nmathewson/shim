@@ -14,23 +14,23 @@
 #include "util.h"
 #include "log.h"
 
-#define METHOD0(conn, slot) \
+#define EVENT0(conn, slot) \
 	(conn)->cbs->slot((conn), (conn)->cbarg)
-#define METHOD1(conn, slot, a) \
+#define EVENT1(conn, slot, a) \
 	(conn)->cbs->slot((conn), (a), (conn)->cbarg)
-#define METHOD2(conn, slot, a, b) \
+#define EVENT2(conn, slot, a, b) \
 	(conn)->cbs->slot((conn), (a), (b), (conn)->cbarg)
-#define METHOD3(conn, slot, a, b, c) \
+#define EVENT3(conn, slot, a, b, c) \
 	(conn)->cbs->slot((conn), (a), (b), (c), (conn)->cbarg)
-#define METHOD4(conn, slot, a, b, c, d) \
+#define EVENT4(conn, slot, a, b, c, d) \
 	(conn)->cbs->slot((conn), (a), (b), (c), (d), (conn)->cbarg)
 
 /* max amount of data we can have backlogged on outbuf before choaking */
 static size_t max_write_backlog = 50 * 1024;
 
 /* the number of seconds to keep an idle connections hanging around */
-static int idle_client_timeout = 120;
-static int idle_server_timeout = 120;
+static struct timeval idle_client_timeout = {120, 0};
+static struct timeval idle_server_timeout = {120, 0};
 
 struct http_conn {
 	enum http_state state;
@@ -45,6 +45,7 @@ struct http_conn {
 	int persistent;
 	const struct http_cbs *cbs;
 	void *cbarg;
+	ev_int64_t body_length;
 	ev_int64_t data_remaining;
 	char *firstline;
 	struct header_list *headers;
@@ -74,8 +75,8 @@ method_from_string(enum http_method *m, const char *method)
 	return 0;
 }
 
-static const char *
-method_to_string(enum http_method m)
+const char *
+http_method_to_string(enum http_method m)
 {
 	switch (m) {
 	case METH_GET:
@@ -90,7 +91,7 @@ method_to_string(enum http_method m)
 		return "CONNECT";
 	}
 
-	log_fatal("method_to_string: unknown method %d", m);
+	log_fatal("http_method_to_string: unknown method %d", m);
 	return "???";
 }
 
@@ -119,8 +120,8 @@ version_from_string(enum http_version *v, const char *vers)
 	return 0;
 }
 
-static const char *
-version_to_string(enum http_version v)
+const char *
+http_version_to_string(enum http_version v)
 {
 	switch (v) {
 	case HTTP_UNKNOWN:
@@ -131,7 +132,7 @@ version_to_string(enum http_version v)
 		return "HTTP/1.1";
 	}
 	
-	log_fatal("version_to_string: unknown version %d", v);
+	log_fatal("http_version_to_string: unknown version %d", v);
 	return "???";
 }
 
@@ -174,7 +175,8 @@ error_code_to_reason_string(int code)
 	case 417:
 		return "Expectation Failed";
 	case 421:
-		return "There are too many connections from your internet address";
+		return "There are too many connections from your internet "
+		       "address";
 	case 500:
 		return "Internal Server Error";
 	case 501:
@@ -194,16 +196,46 @@ error_code_to_reason_string(int code)
 	return "???";
 }
 
+const char *
+http_conn_error_to_string(enum http_conn_error err)
+{
+	switch (err) {
+	case ERROR_NONE:
+		return "No error";
+	case ERROR_CONNECT_FAILED:
+		return "Connection failed";
+	case ERROR_IDLE_CONN_TIMEDOUT:
+		return "Idle connection timed out";
+	case ERROR_CLIENT_POST_WITHOUT_LENGTH:
+		return "Client post with unknown length";
+	case ERROR_INCOMPLETE_HEADERS:
+		return "Connection terminated while reading headers";
+	case ERROR_INCOMPLETE_BODY:
+		return "Connection terminated prematurely while reading body";
+	case ERROR_HEADER_PARSE_FAILED:
+		return "Invalid headers";
+	case ERROR_CHUNK_PARSE_FAILED:
+		return "Invalid chunked data";
+	case ERROR_WRITE_FAILED:
+		return "Write failed";
+	}
+
+	return "???";
+}
+
 static void
 begin_message(struct http_conn *conn)
 {
-	// XXX read timeout?
 	assert(conn->headers == NULL && conn->firstline == NULL);
 	assert(!conn->read_paused);
 	conn->headers = mem_calloc(1, sizeof(*conn->headers));
 	TAILQ_INIT(conn->headers);
 	conn->state = HTTP_STATE_IDLE;
 	bufferevent_enable(conn->bev, EV_READ);
+	if (conn->type == HTTP_SERVER)
+		bufferevent_set_timeouts(conn->bev, &idle_server_timeout, NULL);
+	else
+		bufferevent_set_timeouts(conn->bev, &idle_client_timeout, NULL);
 }
 
 static void
@@ -221,9 +253,9 @@ end_message(struct http_conn *conn, enum http_conn_error err)
 		begin_message(conn);
 
 	if (err != ERROR_NONE)
-		METHOD1(conn, on_error, err);
+		EVENT1(conn, on_error, err);
 	else
-		METHOD0(conn, on_msg_complete);
+		EVENT0(conn, on_msg_complete);
 }
 
 static struct http_request *
@@ -343,11 +375,15 @@ read_chunk(struct http_conn *conn)
 	struct evbuffer *inbuf = bufferevent_get_input(conn->bev);
 	size_t len;
 	char *line;
+	int ret;
 	
 	while ((len = evbuffer_get_length(inbuf)) > 0) {
 		if (conn->data_remaining < 0) {
-			if (parse_chunk_len(conn) < 0) {
-				end_message(conn, ERROR_CHUNK_PARSE_FAILED);
+			ret = parse_chunk_len(conn);
+			if (ret <= 0) {
+				if (ret < 0)
+					end_message(conn,
+						    ERROR_CHUNK_PARSE_FAILED);
 				return;
 			}
 		} else if (conn->data_remaining == 0) {
@@ -365,7 +401,7 @@ read_chunk(struct http_conn *conn)
 
 			evbuffer_remove_buffer(inbuf, conn->inbuf_processed,
 					       len);
-			METHOD1(conn, on_read_body, conn->inbuf_processed);
+			EVENT1(conn, on_read_body, conn->inbuf_processed);
 			conn->data_remaining -= len;
 
 			if (conn->data_remaining == 0)
@@ -394,10 +430,10 @@ read_body(struct http_conn *conn)
 		    len > (size_t)conn->data_remaining) {
 			len = (size_t)conn->data_remaining;
 			evbuffer_remove_buffer(inbuf, conn->inbuf_processed, len);
-			METHOD1(conn, on_read_body, conn->inbuf_processed);
+			EVENT1(conn, on_read_body, conn->inbuf_processed);
 		} else {
 			evbuffer_add_buffer(conn->inbuf_processed, inbuf);
-			METHOD1(conn, on_read_body, conn->inbuf_processed);
+			EVENT1(conn, on_read_body, conn->inbuf_processed);
 		}
 
 		conn->data_remaining -= len;
@@ -418,6 +454,7 @@ check_headers(struct http_conn *conn, struct http_request *req,
 	conn->has_body = 1;
 	conn->msg_complete_on_eof = 0;
 	conn->data_remaining = -1;
+	conn->body_length = -1;
 
 	if (conn->type == HTTP_CLIENT) {
 		vers = req->vers;
@@ -447,25 +484,29 @@ check_headers(struct http_conn *conn, struct http_request *req,
 			if (val) {
 				ev_int64_t iv;
 				iv = get_int(val, 10);
-				if (iv < 0)
-					log_warn("http_conn: mangled Content-Length");
-				else
-					conn->data_remaining = iv;
+				if (iv < 0) {
+					log_warn("http_conn: mangled "
+						 "Content-Length");
+					headers_remove(conn->headers,
+						       "content-length");
+				} else
+					conn->body_length = iv;
 				mem_free(val);
-				if (conn->data_remaining == 0)
+				if (conn->body_length == 0)
 					conn->has_body = 0;
 			} else {
 				conn->msg_complete_on_eof = 1;
 			}
 		}
 
-		if (conn->type == HTTP_CLIENT && conn->data_remaining < 0 &&
+		if (conn->type == HTTP_CLIENT && conn->body_length < 0 &&
 		    conn->te != TE_CHUNKED) {
-			METHOD1(conn, on_error,
+			EVENT1(conn, on_error,
 				ERROR_CLIENT_POST_WITHOUT_LENGTH);
 			return;
 		}
 	}
+	conn->data_remaining = conn->body_length;
 
 	assert(vers != HTTP_UNKNOWN);
 
@@ -488,11 +529,6 @@ check_headers(struct http_conn *conn, struct http_request *req,
 		}
 	}
 	conn->persistent = persistent;
-
-	if (req)
-		req->te = conn->te;
-	else if (resp)
-		resp->te = conn->te;
 }
 
 static void
@@ -540,9 +576,9 @@ read_headers(struct http_conn *conn)
 
 	/* ownership of req or resp is now passed on */
 	if (req)
-		METHOD1(conn, on_client_request, req);
+		EVENT1(conn, on_client_request, req);
 	if (resp)
-		METHOD1(conn, on_server_response, resp);
+		EVENT1(conn, on_server_response, resp);
 
 	if (!conn->has_body)
 		end_message(conn, ERROR_NONE);
@@ -559,10 +595,10 @@ http_errorcb(struct bufferevent *bev, short what, void *_conn)
 	if (conn->state == HTTP_STATE_CONNECTING) {
 		if (what & BEV_EVENT_CONNECTED) {
 			begin_message(conn);
-			METHOD0(conn, on_connect);
+			EVENT0(conn, on_connect);
 		} else {	
 			conn->state = HTTP_STATE_MANGLED;
-			METHOD1(conn, on_error, ERROR_CONNECT_FAILED);
+			EVENT1(conn, on_error, ERROR_CONNECT_FAILED);
 		}
 		return;
 	}
@@ -604,7 +640,7 @@ process_one_step(struct http_conn *conn)
 	switch (conn->state) {
 	case HTTP_STATE_IDLE:
 		conn->state = HTTP_STATE_READ_FIRSTLINE;
-		// XXX should remove idle timeout at this point?
+		bufferevent_set_timeouts(conn->bev, NULL, NULL);
 		/* fallthru... */
 	case HTTP_STATE_READ_FIRSTLINE:
 		assert(conn->firstline == NULL);
@@ -653,9 +689,9 @@ http_writecb(struct bufferevent *bev, void *_conn)
 	if (conn->is_choaked) {
 		bufferevent_setwatermark(bev, EV_WRITE, 0, 0);
 		conn->is_choaked = 0;
-		METHOD0(conn, on_write_more);
+		EVENT0(conn, on_write_more);
 	} else if (evbuffer_get_length(outbuf) == 0)
-		METHOD0(conn, on_flush);
+		EVENT0(conn, on_flush);
 }
 
 struct http_conn *
@@ -710,6 +746,9 @@ void
 http_conn_free(struct http_conn *conn)
 {
 	http_conn_stop_reading(conn);
+	bufferevent_disable(conn->bev, EV_WRITE);
+	bufferevent_setcb(conn->bev, NULL, NULL, NULL, NULL);
+	conn->cbs = NULL;
 	event_base_once(conn->base, -1, EV_TIMEOUT, deferred_free, conn, NULL);
 }
 
@@ -721,16 +760,14 @@ http_conn_write_request(struct http_conn *conn, struct http_request *req)
 	assert(conn->type == HTTP_SERVER);
 
 	headers_remove(req->headers, "connection");
-
-	conn->output_te = req->te;
 	req->vers = HTTP_11;
 		
 	outbuf = bufferevent_get_output(conn->bev);
 
 	evbuffer_add_printf(outbuf, "%s %s %s\r\n",
-		method_to_string(req->meth),
-		req->url->query,
-		version_to_string(req->vers));
+		http_method_to_string(req->meth),
+		req->url->path,
+		http_version_to_string(req->vers));
 		
 	headers_dump(req->headers, outbuf);	
 }
@@ -744,19 +781,21 @@ http_conn_write_response(struct http_conn *conn, struct http_response *resp)
 	assert(conn->vers != HTTP_UNKNOWN);
 
 	headers_remove(resp->headers, "connection");
+	headers_remove(resp->headers, "transfer-encoding");
 	resp->vers = conn->vers;
 
-	conn->output_te = resp->te;
 	if (conn->vers == HTTP_10) {
 		conn->output_te = TE_IDENTITY;
-		headers_remove(resp->headers, "transfer-encoding");
 		headers_add_key_val(resp->headers, "Connection", "close");
+	} else if (conn->output_te == TE_CHUNKED) {
+		headers_add_key_val(resp->headers,
+			            "Transfer-Encoding", "chunked");
 	}
 
 	outbuf = bufferevent_get_output(conn->bev);
 
 	evbuffer_add_printf(outbuf, "%s %d %s\r\n",
-		        version_to_string(conn->vers),
+		        http_version_to_string(conn->vers),
 			resp->code,
 			resp->reason);
 		
@@ -810,6 +849,24 @@ http_conn_set_current_message_bodyless(struct http_conn *conn)
 	conn->has_body = 0;
 }
 
+enum http_te
+http_conn_get_current_message_body_encoding(struct http_conn *conn)
+{
+	return conn->te;
+}
+
+ev_int64_t
+http_conn_get_current_message_body_length(struct http_conn *conn)
+{
+	return conn->body_length;
+}
+
+void
+http_conn_set_output_encoding(struct http_conn *conn, enum http_te te)
+{
+	conn->output_te = te;
+}
+
 int
 http_conn_is_persistent(struct http_conn *conn)
 {
@@ -842,7 +899,7 @@ http_conn_flush(struct http_conn *conn)
 
 	// XXX this might cause recursion
 	if (evbuffer_get_length(outbuf) == 0)
-		METHOD0(conn, on_flush);
+		EVENT0(conn, on_flush);
 }
 
 void
@@ -859,7 +916,7 @@ http_conn_send_error(struct http_conn *conn, int code, const char *fmt, ...)
 	msg = evbuffer_new();
 	resp.headers = &headers;
 
-	resp.te = TE_IDENTITY;
+	conn->output_te = TE_IDENTITY;
 	resp.vers = HTTP_11;
 	resp.code = code;
 	resp.reason = (char*)error_code_to_reason_string(code);
@@ -947,9 +1004,9 @@ proxy_request(struct http_conn *conn, struct http_request *req, void *arg)
 	struct evbuffer *buf;
 
 	fprintf(stderr, "request: %s %s %s\n",
-			method_to_string(req->meth),
-			req->url->query,
-			version_to_string(req->vers));
+			http_method_to_string(req->meth),
+			req->url->path,
+			http_version_to_string(req->vers));
 
 	buf = evbuffer_new();
 	headers_dump(req->headers, buf);
@@ -966,7 +1023,7 @@ proxy_response(struct http_conn *conn, struct http_response *resp, void *arg)
 	struct evbuffer *buf;
 
 	fprintf(stderr, "response: %s, %d, %s\n",
-		version_to_string(resp->vers),
+		http_version_to_string(resp->vers),
 		resp->code,
 		resp->reason);
 

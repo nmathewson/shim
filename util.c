@@ -1,4 +1,5 @@
 #include <netinet/in.h>
+#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
@@ -82,7 +83,7 @@ tokenize(const char *buf, const char *sep, int lim,
 
 	ntok = 0;
 
-	while ((lim < 0 || ntok < (unsigned)lim) && (p = strpbrk(buf, sep))) {
+	while ((lim < 0 || ntok < (size_t)lim) && (p = strpbrk(buf, sep))) {
 		len = p - buf;
 		add_token(buf, len, tokens);
 		buf += len + 1;
@@ -124,70 +125,79 @@ get_int(const char *buf, int base)
 	return rv;
 }
 
+// XXX should this do more to sanitize the url?
 struct url *
 url_tokenize(const char *str)
 {
 	struct url *url;
+	size_t ntokens;
 	char *p;
+	struct token_list tokens;
+	struct token *scheme, *slash, *hostport, *path;
+	size_t len;
+	long port = -1;
+	char *pathstr;
 
-#define DUP(dst, src, len) 			\
-	do { 					\
-		if (len == 0) 			\
-			goto fail; 		\
-		dst = mem_strdup_n(src, len); 	\
-	} while (0)
+	url = NULL;	
+	TAILQ_INIT(&tokens);
+
+	ntokens = tokenize(str, "/", 3, &tokens);
+
+	if (ntokens < 3)
+		goto out;
+
+	scheme = TAILQ_FIRST(&tokens);
+	len = strlen(scheme->token);
+	if (len	< 2 || scheme->token[len - 1] != ':')
+		goto out;
+	scheme->token[len - 1] = '\0';
+
+	slash = TAILQ_NEXT(scheme, next);	
+	if (slash->token[0] != '\0')
+		goto out;
+
+	hostport = TAILQ_NEXT(slash, next);
+	if (hostport->token[0] == '\0')
+		goto out;
+	// XXX this could break IPv6 addresses
+	p = strrchr(hostport->token, ':');
+	if (p) {
+		char *endp;
+
+		*p++ = '\0';
+		errno = 0;
+		port = strtol(p, &endp, 10);
+		if (errno == ERANGE || !endp || *endp != '\0' ||
+		    port < 1 || port > 0xffff)
+			goto out;
+	}
+
+	if (ntokens > 3) {
+		// XXX maybe urlencode?
+		assert(ntokens == 4);
+		path = TAILQ_NEXT(hostport, next);
+		len = strlen(path->token);
+		pathstr = mem_calloc(1, 2 + len);
+		pathstr[0] = '/';
+		memcpy(pathstr + 1, path->token, len);
+	} else
+		pathstr = strdup("/");
+	
 
 	url = mem_calloc(1, sizeof(*url));
-	url->port = -1;
+	url->scheme = scheme->token;
+	url->host = hostport->token;
+	url->port = port;
+	url->path = pathstr;
 
-	p = strstr(str, "://");
-	if (!p) {
-		if (*str != '/')
-			goto fail;
-		else
-			DUP(url->query, str, strlen(str));
-		return url;
-	}
-	
-	DUP(url->scheme, str, p - str);
-	str = p + 3;
-	
-	p = strchr(str, ':');
-	if (p) {
-		long port;
+	scheme->token = NULL;
+	hostport->token = NULL;
 
-		DUP(url->host, str, p - str);
-		port = strtol(p + 1, &p, 10);
-		if (port < 1 || port > 0xffff)
-			goto fail;
-		if (p) {
-			if (*p == '\0')
-				p = NULL;
-			else if (*p != '/')
-				goto fail;
-		}
-		url->port = port;
-	} else {
-		p = strchr(str, '/');
-		if (p)
-			DUP(url->host, str, p - str);
-		else
-			DUP(url->host, str, strlen(str));
-	}
-
-	if (p)
-		DUP(url->query, p, strlen(p));
-	else
-		url->query = mem_strdup("/");
-
-#undef DUP
+out:
+	token_list_clear(&tokens);
 
 	return url;
-
-fail:
-	url_free(url);
-	return NULL;
-}
+}	
 
 void
 url_free(struct url *url)
@@ -197,7 +207,7 @@ url_free(struct url *url)
 
 	mem_free(url->scheme);
 	mem_free(url->host);
-	mem_free(url->query);
+	mem_free(url->path);
 	mem_free(url);
 }
 
@@ -250,13 +260,17 @@ socket_error_string(evutil_socket_t s)
 
 int main(int argc, char **argv)
 {
-	struct sockaddr_storage ss;
-	int len = sizeof(ss);
+	struct url *url;
 
-	if (evutil_parse_sockaddr_port(argv[1], &ss, &len) < 0)
+	url = url_tokenize(argv[1]);
+	if (!url) {
+		printf("bad url!\n");
 		return 0;
-	printf("ur addr: %s\n", format_addr((struct sockaddr *)&ss));
-	
+	}	
+	printf("%s, %s, %d, %s\n",
+		url->scheme, url->host, url->port, url->path);
+	url_free(url);
+
 	return 0;
 }
 #endif

@@ -26,7 +26,7 @@ struct url {
 	char *scheme;
 	char *host;
 	int port;
-	char *query;
+	char *path;
 };
 struct url *url_tokenize(const char *str);
 void url_free(struct url *url);
