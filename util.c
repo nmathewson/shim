@@ -125,6 +125,49 @@ get_int(const char *buf, int base)
 	return rv;
 }
 
+static int
+get_port(const char *str)
+{
+	long port;
+	char *endp;
+
+	errno = 0;
+	port = strtol(str, &endp, 10);
+	if (errno == ERANGE || !endp || *endp != '\0' ||
+	    port < 1 || port > 0xffff)
+		return -1;
+
+	return port;
+}
+
+// tokenize a CONNECT host:port request
+struct url *
+url_connect_tokenize(const char *str)
+{
+	struct url *url;
+	char *p;
+	int port;
+
+	url = mem_calloc(1, sizeof(*url));
+
+	p = strrchr(str, ':');
+	if (!p || p == str)
+		goto fail;
+	port = get_port(p + 1);
+	if (port < 0)
+		goto fail;	
+
+	url->host = mem_strdup_n(str, p - str);
+	url->port = port;
+
+	return url;	
+
+fail:
+	url_free(url);
+
+	return NULL;
+}
+
 // XXX should this do more to sanitize the url?
 struct url *
 url_tokenize(const char *str)
@@ -135,7 +178,7 @@ url_tokenize(const char *str)
 	struct token_list tokens;
 	struct token *scheme, *slash, *hostport, *path;
 	size_t len;
-	long port = -1;
+	int port = -1;
 	char *pathstr;
 
 	url = NULL;	
@@ -161,14 +204,12 @@ url_tokenize(const char *str)
 		goto out;
 	// XXX this could break IPv6 addresses
 	p = strrchr(hostport->token, ':');
-	if (p) {
-		char *endp;
-
+	if (p == hostport->token)
+		goto out;
+	if (p && p[1] != '\0') {
 		*p++ = '\0';
-		errno = 0;
-		port = strtol(p, &endp, 10);
-		if (errno == ERANGE || !endp || *endp != '\0' ||
-		    port < 1 || port > 0xffff)
+		port = get_port(p);
+		if (port < 0)
 			goto out;
 	}
 

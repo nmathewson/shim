@@ -30,6 +30,7 @@ TAILQ_HEAD(server_list, server);
 
 enum client_state {
 	CLIENT_STATE_ACTIVE,
+	CLIENT_STATE_TUNNEL,
 	CLIENT_STATE_CLOSING
 };
 
@@ -101,6 +102,13 @@ server_new(const char *host, int port, struct client *client)
 	return server;
 }
 
+static inline int
+server_match(const struct server *server, const char *host, int port)
+{
+	return (!evutil_ascii_strcasecmp(server->host, host) &&
+		server->port == port);
+}
+
 static void
 server_free(struct server *server)
 {
@@ -132,33 +140,6 @@ server_connect(struct server *server)
 	// XXX AF_UNSPEC seems to cause crashes w/ IPv6 queries
 	return http_conn_connect(server->conn, proxy_evdns_base, AF_INET,
 				 server->host, server->port);
-}
-
-static int
-server_write_client_request(struct server *server)
-{
-	struct http_request *req;
-
-	req = TAILQ_FIRST(&server->client->requests);
-	
-	if (!req || server->state == SERVER_STATE_REQUEST_SENT ||
-	    server->state < SERVER_STATE_CONNECTED)
-		return 0;
-
-	/* it might be nice to support pipelining... */
-	if (!evutil_ascii_strcasecmp(server->host, req->url->host) &&
-	    server->port == req->url->port) {
-		log_debug("proxy: writing %s request for %s from client %p to "
-			  "server %p, %s:%d", 
-			  http_method_to_string(req->meth),
-			  req->url->path, server->client, server,
-			  server->host, server->port);
-		http_conn_write_request(server->conn, req);
-		server->state = SERVER_STATE_REQUEST_SENT;
-		return 1;
-	}
-
-	return 0;
 }
 
 static struct client *
@@ -199,28 +180,32 @@ client_free(struct client *client)
 static int
 client_scrub_request(struct client *client, struct http_request *req)
 {
-	if (!req->url->host) {
-		http_conn_send_error(client->conn, 403, "Forbidden");
-		goto fail;
-	}
-	if (evutil_ascii_strcasecmp(req->url->scheme, "http")) {
-		http_conn_send_error(client->conn, 400, "Invalid URL");
-		goto fail;
-	}
+	if (req->meth == METH_CONNECT) {
+		assert(req->url->host && req->url->port >= 1);
+		// XXX we could filter host/port here
+	} else {
+		if (!req->url->host) {
+			http_conn_send_error(client->conn, 403, "Forbidden");
+			goto fail;
+		}
+		if (evutil_ascii_strcasecmp(req->url->scheme, "http")) {
+			http_conn_send_error(client->conn, 400, "Invalid URL");
+			goto fail;
+		}
 
-	if (req->url->port < 0)
-		req->url->port = 80;
+		if (req->url->port < 0)
+			req->url->port = 80;
 
-	if (!headers_has_key(req->headers, "Host")) {
-		char *host;
-		size_t len = strlen(req->url->host) + 6;
-		host = mem_calloc(1, len);
-		evutil_snprintf(host, len, "%s:%d", req->url->host,
-				req->url->port);
-		headers_add_key_val(req->headers, "Host", host);
-		mem_free(host);	
+		if (!headers_has_key(req->headers, "Host")) {
+			char *host;
+			size_t len = strlen(req->url->host) + 6;
+			host = mem_calloc(1, len);
+			evutil_snprintf(host, len, "%s:%d", req->url->host,
+					req->url->port);
+			headers_add_key_val(req->headers, "Host", host);
+			mem_free(host);	
+		}
 	}
-
 	// XXX remove proxy auth msgs?
 
 	return 0;
@@ -230,25 +215,52 @@ fail:
 	return -1;
 }
 
+static void
+client_disassociate_server(struct client *client)
+{
+	if (!client->server)
+		return;
+
+	if (http_conn_is_persistent(client->server->conn)) {
+		assert(client->server->state == SERVER_STATE_IDLE);
+		TAILQ_INSERT_TAIL(&idle_servers, client->server, next);
+		client->server->client = NULL;
+		client->server = NULL;
+	} else {
+		server_free(client->server);
+		client->server = NULL;
+	}
+}
+
+/* find a server to handle our current req */
 static int
 client_associate_server(struct client *client)
 {
 	struct server *it;
 	struct url *url;
+	struct http_request *req;
 
-	assert(client->server == NULL);
-
-	if (client->nrequests == 0)
+	req = TAILQ_FIRST(&client->requests);
+	if (!req)
 		return 0;
+	
+	url = req->url;
+	assert(url && url->host != NULL && url->port > 0);
 
-	url = TAILQ_FIRST(&client->requests)->url;
+	/* should we remove our current server? */
+	if (client->server &&
+	    (!server_match(client->server, url->host, url->port) ||
+	     req->meth == METH_CONNECT)) {
+		client_disassociate_server(client);
+	}
 
-	assert(url->host != NULL && url->port > 0);
+	/* nothing more to do here... */
+	if (req->meth == METH_CONNECT)
+		return 0;
 
 	/* try to find an idle server */
 	TAILQ_FOREACH(it, &idle_servers, next) {
-		if (!evutil_ascii_strcasecmp(it->host, url->host) &&
-		    it->port == url->port) {
+		if (server_match(it, url->host, url->port)) {
 			TAILQ_REMOVE(&idle_servers, it, next);
 			assert(it->client == NULL);
 			client->server = it;
@@ -263,6 +275,45 @@ client_associate_server(struct client *client)
 	client->server = server_new(url->host, url->port, client);
 
 	return server_connect(client->server);	
+}
+
+/* returns 1 when there's a request we can dispatch with the associated
+   server. */
+static int
+client_dispatch_request(struct client *client)
+{
+	struct http_request *req;
+	struct server *server = client->server;
+
+	req = TAILQ_FIRST(&client->requests);
+	if (!req)
+		return 0;
+
+	if (req->meth == METH_CONNECT) {
+		assert(server == NULL);
+		http_conn_start_tunnel(client->conn, proxy_evdns_base, AF_INET,
+				       req->url->host, req->url->port);
+		return 0;
+	}
+	
+	assert(server != NULL);
+	if (server->state == SERVER_STATE_REQUEST_SENT ||
+	    server->state < SERVER_STATE_CONNECTED)
+		return 0;
+
+	/* it might be nice to support pipelining... */
+	if (server_match(server, req->url->host, req->url->port)) {
+		log_debug("proxy: writing %s request for %s from client %p to "
+			  "server %p, %s:%d", 
+			  http_method_to_string(req->meth),
+			  req->url->path, server->client, server,
+			  server->host, server->port);
+		http_conn_write_request(server->conn, req);
+		server->state = SERVER_STATE_REQUEST_SENT;
+		return 1;
+	}
+
+	return 0;
 }
 
 static void
@@ -316,31 +367,24 @@ client_request_serviced(struct client *client)
 	http_request_free(req);
 	client->nrequests--;
 
-	if (client->server) {
-		/* let's try to reuse this server connection */
-		if (http_conn_is_persistent(client->server->conn)) {
-			if (!server_write_client_request(client->server)) {
-				client->server->state = SERVER_STATE_IDLE;
-				TAILQ_INSERT_TAIL(&idle_servers,
-						  client->server,
-						  next);
-				client->server->client = NULL;
-				client->server = NULL;
-			}
-		} else {
-			server_free(client->server);
-			client->server = NULL;
-		}
-	}
+	if (client->server)
+		client->server->state = SERVER_STATE_IDLE;
+	if (client->nrequests) {
+		client_associate_server(client);
+		client_dispatch_request(client);
+	} else
+		client_disassociate_server(client);
 
-	if (!http_conn_is_persistent(client->conn)) {
-		// XXX maybe shutdown the socket?
-		client->state = CLIENT_STATE_CLOSING;
-		http_conn_stop_reading(client->conn);
-		http_conn_flush(client->conn);
-	} else if (!http_conn_current_message_has_body(client->conn) &&
-		   client->nrequests < max_pending_requests) {
-		http_conn_start_reading(client->conn);
+	if (client->state != CLIENT_STATE_TUNNEL) {
+		if (!http_conn_is_persistent(client->conn)) {
+			// XXX maybe shutdown the socket?
+			client->state = CLIENT_STATE_CLOSING;
+			http_conn_stop_reading(client->conn);
+			http_conn_flush(client->conn);
+		} else if (!http_conn_current_message_has_body(client->conn) &&
+			   client->nrequests < max_pending_requests) {
+			http_conn_start_reading(client->conn);
+		}
 	}
 }
 
@@ -373,6 +417,7 @@ on_client_error(struct http_conn *conn, enum http_conn_error err, void *arg)
 		log_warn("proxy: client error: %s",
 			 http_conn_error_to_string(err));
 	}
+	// XXX return an error message as needed
 	client_free(arg);
 }
 
@@ -380,17 +425,6 @@ static void
 on_client_request(struct http_conn *conn, struct http_request *req, void *arg)
 {
 	struct client *client = arg;
-
-	// - translate proxy request into a server request
-	// - if the proxy request doesn't include a scheme and host,
-	//   probably reject with 404 not found
-	// - create a new transaction for this request
-	// - if npending >= max_pending_requests OR the request has a msg body
-	//   coming, stop reading from the conn for now
-	// - if client has no active server, connect or reuse an idle one
-	// - if the active server is for the same address and port as the request,
-	//   and the server is known to support pipelining, write the request to
-	//   the server
 
 	assert(client->state == CLIENT_STATE_ACTIVE);
 
@@ -407,10 +441,13 @@ on_client_request(struct http_conn *conn, struct http_request *req, void *arg)
 		  req->url->host, req->url->port, req->url->path,
 		  (unsigned)client->nrequests);
 
+	if (req->meth == METH_CONNECT)
+		client->state = CLIENT_STATE_TUNNEL;
+
 	if (!client->server && client_associate_server(client) < 0)
 		return;
 
-	server_write_client_request(client->server);
+	client_dispatch_request(client);
 }
 
 static void
@@ -458,7 +495,7 @@ on_server_connected(struct http_conn *conn, void *arg)
 	server->state = SERVER_STATE_CONNECTED;
 	log_debug("proxy: server %p, %s:%d finished connecting",
 		  server, server->host, server->port);
-	server_write_client_request(server);
+	client_dispatch_request(server->client);
 }
 
 static void

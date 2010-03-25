@@ -38,9 +38,10 @@ struct http_conn {
 	enum http_te te;
 	enum http_type type;
 	enum http_te output_te;
-	int is_choaked;
+	int choked;
 	int has_body;
 	int read_paused;
+	int tunnel_read_paused;
 	int msg_complete_on_eof;
 	int persistent;
 	const struct http_cbs *cbs;
@@ -51,6 +52,7 @@ struct http_conn {
 	struct header_list *headers;
 	struct event_base *base;
 	struct bufferevent *bev;
+	struct bufferevent *tunnel_bev;
 	struct evbuffer *inbuf_processed;
 };
 
@@ -218,6 +220,10 @@ http_conn_error_to_string(enum http_conn_error err)
 		return "Invalid chunked data";
 	case ERROR_WRITE_FAILED:
 		return "Write failed";
+	case ERROR_TUNNEL_CONNECT_FAILED:
+		return "Tunnel connection failed";
+	case ERROR_TUNNEL_CLOSED:
+		return "Tunnel closed";
 	}
 
 	return "???";
@@ -227,11 +233,11 @@ static void
 begin_message(struct http_conn *conn)
 {
 	assert(conn->headers == NULL && conn->firstline == NULL);
-	assert(!conn->read_paused);
 	conn->headers = mem_calloc(1, sizeof(*conn->headers));
 	TAILQ_INIT(conn->headers);
 	conn->state = HTTP_STATE_IDLE;
-	bufferevent_enable(conn->bev, EV_READ);
+	if (!conn->read_paused)
+		bufferevent_enable(conn->bev, EV_READ);
 	if (conn->type == HTTP_SERVER)
 		bufferevent_set_timeouts(conn->bev, &idle_server_timeout, NULL);
 	else
@@ -248,7 +254,7 @@ end_message(struct http_conn *conn, enum http_conn_error err)
 
 	if (err != ERROR_NONE || !conn->persistent) {
 		conn->state = HTTP_STATE_MANGLED;
-		bufferevent_disable(conn->bev, EV_READ);
+		http_conn_stop_reading(conn);
 	} else
 		begin_message(conn);
 
@@ -280,11 +286,17 @@ build_request(struct http_conn *conn)
 
 	method = TAILQ_FIRST(&tokens);
 	url = TAILQ_NEXT(method, next);	
-	vers = TAILQ_NEXT(url, next);	
-	u = url_tokenize(url->token);
+	vers = TAILQ_NEXT(url, next);
 
-	if (!u || method_from_string(&m, method->token) < 0 ||
+	if (method_from_string(&m, method->token) < 0 ||
             version_from_string(&v, vers->token) < 0)
+		goto out;
+
+	if (m == METH_CONNECT)
+		u = url_connect_tokenize(url->token);
+	else
+		u = url_tokenize(url->token);
+	if (!u)
 		goto out;
 
 	req = mem_calloc(1, sizeof(*req));
@@ -356,8 +368,8 @@ parse_chunk_len(struct http_conn *conn)
 		}
 
 		len = get_int(line, 16);
+		mem_free(line);
 		if (len < 0) {
-			mem_free(line);
 			log_warn("parse_chunk_len: invalid chunk len");
 			return -1;
 		}
@@ -429,7 +441,8 @@ read_body(struct http_conn *conn)
 		if (conn->data_remaining >= 0 &&
 		    len > (size_t)conn->data_remaining) {
 			len = (size_t)conn->data_remaining;
-			evbuffer_remove_buffer(inbuf, conn->inbuf_processed, len);
+			evbuffer_remove_buffer(inbuf, conn->inbuf_processed,
+					       len);
 			EVENT1(conn, on_read_body, conn->inbuf_processed);
 		} else {
 			evbuffer_add_buffer(conn->inbuf_processed, inbuf);
@@ -448,6 +461,7 @@ check_headers(struct http_conn *conn, struct http_request *req,
 {
 	enum http_version vers;
 	int persistent;
+	int tunnel;
 	char *val;
 
 	conn->te = TE_IDENTITY;
@@ -455,6 +469,7 @@ check_headers(struct http_conn *conn, struct http_request *req,
 	conn->msg_complete_on_eof = 0;
 	conn->data_remaining = -1;
 	conn->body_length = -1;
+	tunnel = 0;
 
 	if (conn->type == HTTP_CLIENT) {
 		vers = req->vers;
@@ -462,6 +477,8 @@ check_headers(struct http_conn *conn, struct http_request *req,
 		if (req->meth == METH_POST ||
 		    req->meth == METH_PUT)
 			conn->has_body = 1;
+		else if (req->meth == METH_CONNECT)
+			tunnel = 1;
 	} else { /* server */
 		vers = resp->vers;
 		if ((resp->code >= 100 && resp->code < 200) ||
@@ -511,7 +528,7 @@ check_headers(struct http_conn *conn, struct http_request *req,
 	assert(vers != HTTP_UNKNOWN);
 
 	persistent = 0;
-	if (!conn->msg_complete_on_eof && vers == HTTP_11)
+	if (!tunnel && !conn->msg_complete_on_eof && vers == HTTP_11)
 		persistent = 1;
 
 	if (conn->vers != HTTP_UNKNOWN && conn->vers != vers) {
@@ -580,10 +597,130 @@ read_headers(struct http_conn *conn)
 	if (resp)
 		EVENT1(conn, on_server_response, resp);
 
-	if (!conn->has_body)
-		end_message(conn, ERROR_NONE);
+	if (conn->state != HTTP_STATE_TUNNEL_CONNECTING) {
+		if (!conn->has_body)
+			end_message(conn, ERROR_NONE);
+		else
+			conn->state = HTTP_STATE_READ_BODY;
+	}
+}
+
+static void
+tunnel_transfer_data(struct http_conn *conn, struct bufferevent *to,
+		     struct bufferevent *from)
+{
+	struct evbuffer *frombuf = bufferevent_get_input(from);
+	struct evbuffer *tobuf = bufferevent_get_output(to);
+
+	if (evbuffer_get_length(frombuf) == 0)
+		return;
+
+	evbuffer_add_buffer(tobuf, frombuf);
+	if (evbuffer_get_length(tobuf) > max_write_backlog) {
+		bufferevent_setwatermark(to, EV_WRITE,
+					 max_write_backlog / 2, 0);
+		bufferevent_disable(from, EV_READ);
+		if (from == conn->bev) {
+			log_debug("tunnel: throttling client read");
+			conn->read_paused = 1;
+		} else {
+			log_debug("tunnel: throttling server read");
+			conn->tunnel_read_paused = 1;
+		}
+	}
+}
+
+static void
+tunnel_writecb(struct bufferevent *bev, void *_conn)
+{
+	struct http_conn *conn = _conn;
+
+	if (conn->state == HTTP_STATE_TUNNEL_OPEN) {
+		if (conn->tunnel_read_paused && bev == conn->bev) {
+			log_debug("tunnel: unthrottling server read");
+			conn->tunnel_read_paused = 0;
+			bufferevent_enable(conn->tunnel_bev, EV_READ);
+			bufferevent_setwatermark(bev, EV_WRITE, 0, 0);
+		} else if (conn->read_paused && bev == conn->tunnel_bev) {
+			log_debug("tunnel: unthrottling client read");
+			conn->read_paused = 0;
+			bufferevent_enable(conn->bev, EV_READ);
+			bufferevent_setwatermark(bev, EV_WRITE, 0, 0);
+		}
+	} else {
+		log_debug("tunnel: flushed!");
+		bufferevent_setcb(conn->bev, NULL, NULL, NULL, NULL);
+		bufferevent_setcb(conn->tunnel_bev, NULL, NULL, NULL, NULL);
+		EVENT1(conn, on_error, ERROR_TUNNEL_CLOSED);
+	}
+}
+
+static void
+tunnel_readcb(struct bufferevent *bev, void *_conn)
+{
+	struct http_conn *conn = _conn;
+
+	if (bev == conn->bev)
+		tunnel_transfer_data(conn, conn->tunnel_bev, bev);
 	else
-		conn->state = HTTP_STATE_READ_BODY;
+		tunnel_transfer_data(conn, conn->bev, bev);
+}
+
+static void
+tunnel_errorcb(struct bufferevent *bev, short what, void *_conn)
+{
+	struct http_conn *conn = _conn;
+	struct evbuffer *buf;
+
+	switch (conn->state) {
+	case HTTP_STATE_TUNNEL_CONNECTING:
+		assert(bev == conn->tunnel_bev);
+		if (what & BEV_EVENT_CONNECTED) {
+			conn->state = HTTP_STATE_TUNNEL_OPEN;
+			bufferevent_setcb(conn->bev, tunnel_readcb,
+				          tunnel_writecb, tunnel_errorcb, conn);
+			bufferevent_enable(conn->bev, EV_READ);
+			bufferevent_enable(conn->tunnel_bev, EV_READ);
+			conn->read_paused = 0;
+			conn->tunnel_read_paused = 0;
+			tunnel_transfer_data(conn, conn->tunnel_bev, conn->bev);
+			evbuffer_add_printf(bufferevent_get_output(conn->bev),
+					"%s 200 Connection established\r\n\r\n",
+					http_version_to_string(conn->vers));
+		} else {
+			bufferevent_setcb(conn->tunnel_bev, NULL, NULL,
+					  NULL, NULL);
+			EVENT1(conn, on_error, ERROR_TUNNEL_CONNECT_FAILED);
+		}
+		break;
+	case HTTP_STATE_TUNNEL_OPEN:
+		if (bev == conn->bev) {
+			log_debug("tunnel: client closed conn...");
+			bev = conn->tunnel_bev;
+		} else {
+			log_debug("tunnel: server closed conn...");
+			bev = conn->bev;
+		}
+		buf = bufferevent_get_output(bev);
+		if (evbuffer_get_length(buf)) {
+			conn->state = HTTP_STATE_TUNNEL_FLUSHING;
+			log_debug("tunnel: flushing %lu bytes...",
+				  (unsigned long)evbuffer_get_length(buf));
+			bufferevent_disable(bev, EV_READ);
+			bufferevent_setcb(bev, NULL, tunnel_writecb,
+					  tunnel_errorcb, conn);
+			break;
+		}
+		/* nothing left to write.. lets just fall thru... */
+	case HTTP_STATE_TUNNEL_FLUSHING:
+		/* an error happend while flushing, lets just give up. */
+		bufferevent_setcb(conn->bev, NULL, NULL, NULL, NULL);
+		bufferevent_setcb(conn->tunnel_bev, NULL, NULL, NULL, NULL);
+		EVENT1(conn, on_error, ERROR_TUNNEL_CLOSED);
+		break;
+	default:
+		log_fatal("tunnel: errorcb called in invalid state!");
+	}
 }
 
 static void
@@ -686,9 +823,9 @@ http_writecb(struct bufferevent *bev, void *_conn)
 	struct http_conn *conn = _conn;
 	struct evbuffer *outbuf = bufferevent_get_output(bev);
 
-	if (conn->is_choaked) {
+	if (conn->choked) {
 		bufferevent_setwatermark(bev, EV_WRITE, 0, 0);
-		conn->is_choaked = 0;
+		conn->choked = 0;
 		EVENT0(conn, on_write_more);
 	} else if (evbuffer_get_length(outbuf) == 0)
 		EVENT0(conn, on_flush);
@@ -738,6 +875,8 @@ deferred_free(evutil_socket_t s, short what, void *arg)
 {
 	struct http_conn *conn = arg;
 	bufferevent_free(conn->bev);
+	if (conn->tunnel_bev)
+		bufferevent_free(conn->tunnel_bev);
 	evbuffer_free(conn->inbuf_processed);
 	mem_free(conn);
 }
@@ -816,11 +955,11 @@ http_conn_write_buf(struct http_conn *conn, struct evbuffer *buf)
 	if (conn->output_te == TE_CHUNKED)
 		evbuffer_add(outbuf, "\r\n", 2);
 
-	/* have we choaked? */	
+	/* have we choked? */	
 	if (evbuffer_get_length(outbuf) > max_write_backlog) {
 		bufferevent_setwatermark(conn->bev, EV_WRITE,
 					 max_write_backlog / 2, 0);
-		conn->is_choaked = 1;
+		conn->choked = 1;
 		return 0;
 	}
 
@@ -945,6 +1084,26 @@ http_conn_send_error(struct http_conn *conn, int code, const char *fmt, ...)
 	http_conn_write_buf(conn, msg);
 	headers_clear(&headers);
 	evbuffer_free(msg);
+}
+
+int
+http_conn_start_tunnel(struct http_conn *conn, struct evdns_base *dns,
+		       int family, const char *host, int port)
+{
+	assert(conn->type == HTTP_CLIENT);
+	assert(conn->tunnel_bev == NULL);
+
+	http_conn_stop_reading(conn);
+	conn->tunnel_bev = bufferevent_socket_new(conn->base, -1,
+						  BEV_OPT_CLOSE_ON_FREE);
+	bufferevent_setcb(conn->tunnel_bev, tunnel_readcb,
+			  tunnel_writecb, tunnel_errorcb, conn);
+	log_info("tunnel: attempting connection to %s:%d",
+		 log_scrub(host), port);
+	// XXX need SOCKS
+	conn->state = HTTP_STATE_TUNNEL_CONNECTING;
+	return bufferevent_socket_connect_hostname(conn->tunnel_bev, dns,
+						   family, host, port);
 }
 
 void

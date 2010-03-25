@@ -13,7 +13,10 @@ enum http_state {
 	HTTP_STATE_READ_FIRSTLINE,
 	HTTP_STATE_READ_HEADERS,
 	HTTP_STATE_READ_BODY,
-	HTTP_STATE_MANGLED
+	HTTP_STATE_MANGLED,
+	HTTP_STATE_TUNNEL_CONNECTING,
+	HTTP_STATE_TUNNEL_OPEN,
+	HTTP_STATE_TUNNEL_FLUSHING
 };
 
 enum http_type {
@@ -43,7 +46,9 @@ enum http_conn_error {
 	ERROR_INCOMPLETE_BODY,
 	ERROR_HEADER_PARSE_FAILED,
 	ERROR_CHUNK_PARSE_FAILED,
-	ERROR_WRITE_FAILED
+	ERROR_WRITE_FAILED,
+	ERROR_TUNNEL_CONNECT_FAILED,
+	ERROR_TUNNEL_CLOSED
 };
 
 struct evbuffer;
@@ -115,6 +120,9 @@ void http_conn_flush(struct http_conn *conn);
 
 void http_conn_send_error(struct http_conn *conn, int code,
 			  const char *fmt, ...);
+
+int http_conn_start_tunnel(struct http_conn *conn, struct evdns_base *dns,
+		      int family, const char *host, int port);
 
 const char *http_conn_error_to_string(enum http_conn_error err);
 const char *http_method_to_string(enum http_method m);

@@ -28,6 +28,7 @@ struct url {
 	int port;
 	char *path;
 };
+struct url *url_connect_tokenize(const char *str);
 struct url *url_tokenize(const char *str);
 void url_free(struct url *url);
 
