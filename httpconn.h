@@ -41,6 +41,7 @@ enum http_conn_error {
 	ERROR_NONE,
 	ERROR_CONNECT_FAILED,
 	ERROR_IDLE_CONN_TIMEDOUT,
+	ERROR_CLIENT_EXPECTATION_FAILED,
 	ERROR_CLIENT_POST_WITHOUT_LENGTH,
 	ERROR_INCOMPLETE_HEADERS,
 	ERROR_INCOMPLETE_BODY,
@@ -78,6 +79,7 @@ struct http_cbs {
 	void (*on_connect)(struct http_conn *, void *);
 	void (*on_error)(struct http_conn *, enum http_conn_error, void *);
 	void (*on_client_request)(struct http_conn *, struct http_request *, void *);
+	void (*on_server_continuation)(struct http_conn *, void *);
 	void (*on_server_response)(struct http_conn *, struct http_response *, void *);
 	void (*on_read_body)(struct http_conn *, struct evbuffer *, void *);
 	void (*on_msg_complete)(struct http_conn *, void *);
@@ -98,6 +100,8 @@ int http_conn_connect(struct http_conn *conn, struct evdns_base *dns,
 void http_conn_free(struct http_conn *conn);
 
 void http_conn_write_request(struct http_conn *conn, struct http_request *req);
+int http_conn_expect_continue(struct http_conn *conn);
+void http_conn_write_continue(struct http_conn *conn);
 void http_conn_write_response(struct http_conn *conn, struct http_response *resp);
 
 /* return: 0 on choaked, 1 on queued. */

@@ -51,6 +51,7 @@ static void on_client_flush(struct http_conn *, void *);
 
 static void on_server_connected(struct http_conn *, void *);
 static void on_server_error(struct http_conn *, enum http_conn_error, void *);
+static void on_server_continuation(struct http_conn *, void *);
 static void on_server_response(struct http_conn *, struct http_response *, void *);
 static void on_server_read_body(struct http_conn *, struct evbuffer *, void *);
 static void on_server_msg_complete(struct http_conn *, void *);
@@ -62,6 +63,7 @@ static const struct http_cbs client_methods = {
 	on_client_error,
 	on_client_request,
 	0,
+	0,
 	on_client_read_body,
 	on_client_msg_complete,
 	on_client_write_more,
@@ -72,6 +74,7 @@ static const struct http_cbs server_methods = {
 	on_server_connected,
 	on_server_error,
 	0,
+	on_server_continuation,
 	on_server_response,
 	on_server_read_body,
 	on_server_msg_complete,
@@ -183,29 +186,31 @@ client_scrub_request(struct client *client, struct http_request *req)
 	if (req->meth == METH_CONNECT) {
 		assert(req->url->host && req->url->port >= 1);
 		// XXX we could filter host/port here
-	} else {
-		if (!req->url->host) {
-			http_conn_send_error(client->conn, 403, "Forbidden");
-			goto fail;
-		}
-		if (evutil_ascii_strcasecmp(req->url->scheme, "http")) {
-			http_conn_send_error(client->conn, 400, "Invalid URL");
-			goto fail;
-		}
-
-		if (req->url->port < 0)
-			req->url->port = 80;
-
-		if (!headers_has_key(req->headers, "Host")) {
-			char *host;
-			size_t len = strlen(req->url->host) + 6;
-			host = mem_calloc(1, len);
-			evutil_snprintf(host, len, "%s:%d", req->url->host,
-					req->url->port);
-			headers_add_key_val(req->headers, "Host", host);
-			mem_free(host);	
-		}
+		return 0;
 	}
+
+	if (!req->url->host) {
+		http_conn_send_error(client->conn, 403, "Forbidden");
+		goto fail;
+	}
+	if (evutil_ascii_strcasecmp(req->url->scheme, "http")) {
+		http_conn_send_error(client->conn, 400, "Invalid URL");
+		goto fail;
+	}
+
+	if (req->url->port < 0)
+		req->url->port = 80;
+
+	if (!headers_has_key(req->headers, "Host")) {
+		char *host;
+		size_t len = strlen(req->url->host) + 6;
+		host = mem_calloc(1, len);
+		evutil_snprintf(host, len, "%s:%d", req->url->host,
+				req->url->port);
+		headers_add_key_val(req->headers, "Host", host);
+		mem_free(host);	
+	}
+
 	// XXX remove proxy auth msgs?
 
 	return 0;
@@ -277,6 +282,24 @@ client_associate_server(struct client *client)
 	return server_connect(client->server);	
 }
 
+static void
+client_start_reading_request_body(struct client *client, int on_continue)
+{
+	assert(client->server != NULL);
+
+	/* should we wait for the server to send 100 continue? */
+	if (!on_continue && http_conn_expect_continue(client->conn))
+		return;
+
+	if (http_conn_current_message_has_body(client->conn) &&
+	    client->nrequests == 1) {
+		http_conn_write_continue(client->conn);
+		http_conn_set_output_encoding(client->server->conn,
+		     http_conn_get_current_message_body_encoding(client->conn));
+		http_conn_start_reading(client->conn);
+	}
+}
+
 /* returns 1 when there's a request we can dispatch with the associated
    server. */
 static int
@@ -309,20 +332,13 @@ client_dispatch_request(struct client *client)
 			  req->url->path, server->client, server,
 			  server->host, server->port);
 		http_conn_write_request(server->conn, req);
+		// XXX we may want to wait for 100-continue
+		client_start_reading_request_body(client, 0);
 		server->state = SERVER_STATE_REQUEST_SENT;
 		return 1;
 	}
 
 	return 0;
-}
-
-static void
-client_start_reading_request_body(struct client *client)
-{
-	//XXX make sure server knows what transefer encodign to use.
-	if (http_conn_current_message_has_body(client->conn) &&
-	    client->nrequests == 1)
-		http_conn_start_reading(client->conn);
 }
 
 static void
@@ -464,8 +480,10 @@ on_client_msg_complete(struct http_conn *conn, void *arg)
 {
 	struct client *client = arg;
 
-	if (http_conn_current_message_has_body(conn))
+	if (http_conn_current_message_has_body(conn)) {
+		log_debug("proxy: finished reading client's message");
 		http_conn_write_finished(client->server->conn);
+	}
 }
 
 static void
@@ -536,6 +554,15 @@ on_server_error(struct http_conn *conn, enum http_conn_error err, void *arg)
 }
 
 static void
+on_server_continuation(struct http_conn *conn, void *arg)
+{
+	struct server *server = arg;
+
+	log_debug("proxy: got 100 continue from server");
+	client_start_reading_request_body(server->client, 1);
+}
+
+static void
 on_server_response(struct http_conn *conn, struct http_response *resp,
 		   void *arg)
 {
@@ -548,10 +575,7 @@ on_server_response(struct http_conn *conn, struct http_response *resp,
 			  server, server->client);
 
 
-	// XXX maybe not read body on error?
-	// XXX handle expect 100-continue, etc
-
-	client_start_reading_request_body(server->client);
+	// XXX maybe stop reading body on error?
 
 	http_response_free(resp);
 }

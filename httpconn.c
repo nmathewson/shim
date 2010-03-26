@@ -44,6 +44,7 @@ struct http_conn {
 	int tunnel_read_paused;
 	int msg_complete_on_eof;
 	int persistent;
+	int expect_continue;
 	const struct http_cbs *cbs;
 	void *cbarg;
 	ev_int64_t body_length;
@@ -208,6 +209,8 @@ http_conn_error_to_string(enum http_conn_error err)
 		return "Connection failed";
 	case ERROR_IDLE_CONN_TIMEDOUT:
 		return "Idle connection timed out";
+	case ERROR_CLIENT_EXPECTATION_FAILED:
+		return "Can't statisfy client's expectation";
 	case ERROR_CLIENT_POST_WITHOUT_LENGTH:
 		return "Client post with unknown length";
 	case ERROR_INCOMPLETE_HEADERS:
@@ -238,6 +241,7 @@ begin_message(struct http_conn *conn)
 	conn->state = HTTP_STATE_IDLE;
 	if (!conn->read_paused)
 		bufferevent_enable(conn->bev, EV_READ);
+	// XXX we should have a separate function to tell that server is idle.
 	if (conn->type == HTTP_SERVER)
 		bufferevent_set_timeouts(conn->bev, &idle_server_timeout, NULL);
 	else
@@ -249,8 +253,13 @@ end_message(struct http_conn *conn, enum http_conn_error err)
 {
 	if (conn->firstline)
 		mem_free(conn->firstline);
-	if (conn->headers)
+	if (conn->headers) {
 		headers_clear(conn->headers);
+		mem_free(conn->headers);
+	}
+
+	conn->firstline = NULL;
+	conn->headers = NULL;
 
 	if (err != ERROR_NONE || !conn->persistent) {
 		conn->state = HTTP_STATE_MANGLED;
@@ -455,7 +464,7 @@ read_body(struct http_conn *conn)
 	}
 }
 
-static void
+static enum http_conn_error
 check_headers(struct http_conn *conn, struct http_request *req,
 	   struct http_response *resp)
 {
@@ -469,6 +478,7 @@ check_headers(struct http_conn *conn, struct http_request *req,
 	conn->msg_complete_on_eof = 0;
 	conn->data_remaining = -1;
 	conn->body_length = -1;
+	conn->expect_continue = 0;
 	tunnel = 0;
 
 	if (conn->type == HTTP_CLIENT) {
@@ -479,6 +489,25 @@ check_headers(struct http_conn *conn, struct http_request *req,
 			conn->has_body = 1;
 		else if (req->meth == METH_CONNECT)
 			tunnel = 1;
+
+		val = headers_find(conn->headers, "Expect");
+		if (val) {
+			int cont;
+
+			cont = !evutil_ascii_strcasecmp(val, "100-continue");
+			mem_free(val);
+			if (cont == 0 || !conn->has_body)
+				return ERROR_CLIENT_EXPECTATION_FAILED;
+			
+			if (cont && req->vers != HTTP_11) {
+				cont = 0;
+				log_info("http: ignoring expect continue from "
+					 "old client");
+				headers_remove(conn->headers, "Expect");
+			}
+
+			conn->expect_continue = cont;
+		}
 	} else { /* server */
 		vers = resp->vers;
 		if ((resp->code >= 100 && resp->code < 200) ||
@@ -502,7 +531,7 @@ check_headers(struct http_conn *conn, struct http_request *req,
 				ev_int64_t iv;
 				iv = get_int(val, 10);
 				if (iv < 0) {
-					log_warn("http_conn: mangled "
+					log_warn("http: mangled "
 						 "Content-Length");
 					headers_remove(conn->headers,
 						       "content-length");
@@ -517,11 +546,8 @@ check_headers(struct http_conn *conn, struct http_request *req,
 		}
 
 		if (conn->type == HTTP_CLIENT && conn->body_length < 0 &&
-		    conn->te != TE_CHUNKED) {
-			EVENT1(conn, on_error,
-				ERROR_CLIENT_POST_WITHOUT_LENGTH);
-			return;
-		}
+		    conn->te != TE_CHUNKED)
+			return ERROR_CLIENT_POST_WITHOUT_LENGTH;
 	}
 	conn->data_remaining = conn->body_length;
 
@@ -546,6 +572,8 @@ check_headers(struct http_conn *conn, struct http_request *req,
 		}
 	}
 	conn->persistent = persistent;
+
+	return ERROR_NONE;
 }
 
 static void
@@ -555,6 +583,7 @@ read_headers(struct http_conn *conn)
 	struct evbuffer *inbuf = bufferevent_get_input(conn->bev);
 	struct http_request *req = NULL;
 	struct http_response *resp = NULL;
+	enum http_conn_error err;
 
 	assert(conn->state == HTTP_STATE_READ_HEADERS);
 
@@ -588,20 +617,36 @@ read_headers(struct http_conn *conn)
 		return;
 	}
 
-	check_headers(conn, req, resp);
+	err = check_headers(conn, req, resp);
 	conn->headers = NULL;
 
-	/* ownership of req or resp is now passed on */
-	if (req)
-		EVENT1(conn, on_client_request, req);
-	if (resp)
-		EVENT1(conn, on_server_response, resp);
+	if (err == ERROR_NONE) {
+		int server_continuation = 0;
 
-	if (conn->state != HTTP_STATE_TUNNEL_CONNECTING) {
-		if (!conn->has_body)
-			end_message(conn, ERROR_NONE);
-		else
-			conn->state = HTTP_STATE_READ_BODY;
+		/* ownership of req or resp is now passed on */
+		if (req)
+			EVENT1(conn, on_client_request, req);
+		if (resp) {
+			if (resp->code == 100) {
+				http_response_free(resp);
+				EVENT0(conn, on_server_continuation);
+				begin_message(conn);
+				server_continuation = 1;
+			} else
+				EVENT1(conn, on_server_response, resp);
+		}
+
+		if (!server_continuation &&
+		    conn->state != HTTP_STATE_TUNNEL_CONNECTING) {
+			if (!conn->has_body)
+				end_message(conn, ERROR_NONE);
+			else
+				conn->state = HTTP_STATE_READ_BODY;
+		}
+	} else {
+		http_request_free(req);
+		http_response_free(resp);
+		end_message(conn, err);
 	}
 }
 
@@ -911,6 +956,25 @@ http_conn_write_request(struct http_conn *conn, struct http_request *req)
 	headers_dump(req->headers, outbuf);	
 }
 
+int
+http_conn_expect_continue(struct http_conn *conn)
+{
+	return conn->expect_continue;
+}
+
+void
+http_conn_write_continue(struct http_conn *conn)
+{
+	struct evbuffer *outbuf;
+
+	if (conn->expect_continue) {
+		outbuf = bufferevent_get_output(conn->bev);
+		conn->expect_continue = 0;
+		assert(conn->vers == HTTP_11);
+		evbuffer_add_printf(outbuf, "HTTP/1.1 100 Continue\r\n\r\n");
+	}
+}
+
 void
 http_conn_write_response(struct http_conn *conn, struct http_response *resp)
 {
@@ -1109,6 +1173,9 @@ http_conn_start_tunnel(struct http_conn *conn, struct evdns_base *dns,
 void
 http_request_free(struct http_request *req)
 {
+	if (!req)
+		return;
+
 	url_free(req->url);
 	headers_clear(req->headers);
 	mem_free(req);
@@ -1117,6 +1184,9 @@ http_request_free(struct http_request *req)
 void
 http_response_free(struct http_response *resp)
 {
+	if (!resp)
+		return;
+
 	headers_clear(resp->headers);
 	mem_free(resp->headers);
 	mem_free(resp->reason);
