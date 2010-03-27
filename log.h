@@ -13,13 +13,19 @@ enum log_level {
 	LOG_FATAL
 };
 
-void log_debug(const char *msg, ...);
-void log_info(const char *msg, ...);
-void log_notice(const char *msg, ...);
-void log_warn(const char *msg, ...);
-void log_error(const char *msg, ...);
-void log_socket_error(const char *msg, ...);
-void log_fatal(const char *msg, ...);
+#ifdef __GNUC__
+#define CHECK_FMT(a,b) __attribute__((format(printf, a, b)))
+#else
+#define CHECK_FMT(a,b)
+#endif
+
+void log_debug(const char *msg, ...) CHECK_FMT(1,2);
+void log_info(const char *msg, ...) CHECK_FMT(1,2);
+void log_notice(const char *msg, ...) CHECK_FMT(1,2);
+void log_warn(const char *msg, ...) CHECK_FMT(1,2);
+void log_error(const char *msg, ...) CHECK_FMT(1,2);
+void log_socket_error(const char *msg, ...) CHECK_FMT(1,2);
+void log_fatal(const char *msg, ...) CHECK_FMT(1,2);
 
 void log_msg_va(enum log_level lvl, int serr, const char *msg, va_list ap);
 

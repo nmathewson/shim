@@ -52,6 +52,8 @@ enum http_conn_error {
 	ERROR_TUNNEL_CLOSED
 };
 
+#define HTTP_ERROR_RESPONSE(c) (c >= 400 && c <= 599)
+
 struct evbuffer;
 struct event_base;
 struct evdns_base;
@@ -115,6 +117,7 @@ enum http_te http_conn_get_current_message_body_encoding(struct http_conn *conn)
 ev_int64_t http_conn_get_current_message_body_length(struct http_conn *conn);
 void http_conn_set_output_encoding(struct http_conn *conn, enum http_te te);
 int http_conn_is_persistent(struct http_conn *conn);
+void http_conn_disable_persistence(struct http_conn *conn);
 
 /* turn read off/on; useful for when the other end is choking */
 void http_conn_stop_reading(struct http_conn *conn);

@@ -3,6 +3,7 @@
 #include <string.h>
 #include <event2/event.h>
 #include <event2/listener.h>
+#include <event2/buffer.h>
 #include "proxy.h"
 #include "httpconn.h"
 #include "util.h"
@@ -31,6 +32,7 @@ TAILQ_HEAD(server_list, server);
 enum client_state {
 	CLIENT_STATE_ACTIVE,
 	CLIENT_STATE_TUNNEL,
+	CLIENT_STATE_DISCARD_INPUT,
 	CLIENT_STATE_CLOSING
 };
 
@@ -326,10 +328,10 @@ client_dispatch_request(struct client *client)
 
 	/* it might be nice to support pipelining... */
 	if (server_match(server, req->url->host, req->url->port)) {
-		log_debug("proxy: writing %s request for %s from client %p to "
+		log_debug("proxy: writing %s request from client %p to "
 			  "server %p, %s:%d", 
 			  http_method_to_string(req->meth),
-			  req->url->path, server->client, server,
+			  server->client, server,
 			  server->host, server->port);
 		http_conn_write_request(server->conn, req);
 		// XXX we may want to wait for 100-continue
@@ -342,6 +344,26 @@ client_dispatch_request(struct client *client)
 }
 
 static void
+client_discard_input(struct client *client)
+{
+	if (http_conn_current_message_has_body(client->conn)) {
+		log_debug("proxy: will discard client msg body");
+		http_conn_disable_persistence(client->conn);
+		client->state = CLIENT_STATE_DISCARD_INPUT;
+	}
+}
+
+static void
+client_close_on_flush(struct client *client)
+{
+	log_debug("proxy: will close client on flush");
+	client->state = CLIENT_STATE_CLOSING;
+	http_conn_disable_persistence(client->conn);
+	http_conn_stop_reading(client->conn);
+	http_conn_flush(client->conn);
+}
+
+static void
 client_write_response(struct client *client, struct http_response *resp)
 {
 	struct http_request *req;
@@ -349,13 +371,13 @@ client_write_response(struct client *client, struct http_response *resp)
 	req = TAILQ_FIRST(&client->requests);
 	assert(req != NULL);
 
-	log_debug("proxy: got response for %s %s %s from %p, %s:%d: %s %d %s",
+	log_debug("proxy: got response for %s from %p, %s:%d: %s %d",
 		  http_method_to_string(req->meth),
-		  req->url->path,
-		  http_version_to_string(req->vers),
 		  client->server, client->server->host, client->server->port,
-		  http_version_to_string(resp->vers), resp->code,
-		  resp->reason);
+		  http_version_to_string(resp->vers), resp->code);
+
+	if (HTTP_ERROR_RESPONSE(resp->code))
+		client_discard_input(client);
 
 	if (req->meth == METH_HEAD)
 		http_conn_set_current_message_bodyless(client->server->conn);
@@ -376,27 +398,24 @@ client_request_serviced(struct client *client)
 
 	req = TAILQ_FIRST(&client->requests);
 	assert(req && client->nrequests > 0);
-	log_debug("proxy: request for client %p, %s %s %s serviced",
-		  client, http_method_to_string(req->meth), req->url->path,
+	log_debug("proxy: request for client %p, %s %s serviced",
+		  client, http_method_to_string(req->meth), 
 		  http_version_to_string(req->vers));
 	TAILQ_REMOVE(&client->requests, req, next);
 	http_request_free(req);
 	client->nrequests--;
 
-	if (client->server)
-		client->server->state = SERVER_STATE_IDLE;
-	if (client->nrequests) {
-		client_associate_server(client);
-		client_dispatch_request(client);
-	} else
-		client_disassociate_server(client);
+	if (client->state == CLIENT_STATE_ACTIVE) {
+		if (client->server)
+			client->server->state = SERVER_STATE_IDLE;
+		if (client->nrequests) {
+			client_associate_server(client);
+			client_dispatch_request(client);
+		} else
+			client_disassociate_server(client);
 
-	if (client->state != CLIENT_STATE_TUNNEL) {
 		if (!http_conn_is_persistent(client->conn)) {
-			// XXX maybe shutdown the socket?
-			client->state = CLIENT_STATE_CLOSING;
-			http_conn_stop_reading(client->conn);
-			http_conn_flush(client->conn);
+			client_close_on_flush(client);
 		} else if (!http_conn_current_message_has_body(client->conn) &&
 			   client->nrequests < max_pending_requests) {
 			http_conn_start_reading(client->conn);
@@ -416,6 +435,7 @@ client_notice_server_failed(struct client *client)
 		if (evutil_ascii_strcasecmp(req->url->host, server->host) ||
 		    req->url->port != server->port)
 			break;
+		// XXX set a more descriptive error message
 		http_conn_send_error(client->conn, 502,
 				     "Server connection failed");
 		client_request_serviced(client);
@@ -427,14 +447,52 @@ client_notice_server_failed(struct client *client)
 static void
 on_client_error(struct http_conn *conn, enum http_conn_error err, void *arg)
 {
-	if (err == ERROR_IDLE_CONN_TIMEDOUT) {
+	struct client *client = arg;
+
+	switch (err) {
+	case ERROR_CONNECT_FAILED:
+	case ERROR_IDLE_CONN_TIMEDOUT:
 		log_info("proxy: closing idle client connection.");
-	} else {
+		client_free(client);
+		break;
+	case ERROR_CLIENT_EXPECTATION_FAILED:
+		client_discard_input(client);
+		http_conn_send_error(conn, 417, "Expectation failed");
+		break;
+	case ERROR_TUNNEL_CONNECT_FAILED:
+		// XXX need a better msg here
+		http_conn_send_error(conn, 504,
+				      "Connection failed");
+		client_request_serviced(client);
+		break;
+	case ERROR_HEADER_PARSE_FAILED:
+		client_close_on_flush(client);
+		http_conn_send_error(conn, 400,
+			     	     "Couldn't parse client request");
+		break;
+	case ERROR_CLIENT_POST_WITHOUT_LENGTH:
+		client_close_on_flush(client);
+		http_conn_send_error(conn, 400,
+				     "POST or PUT request without length");
+		break;
+	case ERROR_CHUNK_PARSE_FAILED:
+		client_close_on_flush(client);
+		http_conn_send_error(conn, 400,
+				      "Chunk parse failed");
+		break;
+	case ERROR_TUNNEL_CLOSED:
+		log_debug("proxy: tunnel closed.");
+		client_free(client);
+		break;
+	case ERROR_INCOMPLETE_HEADERS:
+	case ERROR_INCOMPLETE_BODY:
+	case ERROR_WRITE_FAILED:
+	default:
 		log_warn("proxy: client error: %s",
 			 http_conn_error_to_string(err));
+		client_free(client);
+		break;
 	}
-	// XXX return an error message as needed
-	client_free(arg);
 }
 
 static void
@@ -452,9 +510,9 @@ on_client_request(struct http_conn *conn, struct http_request *req, void *arg)
 	    http_conn_current_message_has_body(conn))
 		http_conn_stop_reading(conn);
 
-	log_debug("proxy: new %s request for %s:%d%s (pipeline %u)",
+	log_debug("proxy: new %s request for %s:%d (pipeline %u)",
 		  http_method_to_string(req->meth),
-		  req->url->host, req->url->port, req->url->path,
+		  req->url->host, req->url->port,
 		  (unsigned)client->nrequests);
 
 	if (req->meth == METH_CONNECT)
@@ -470,8 +528,10 @@ static void
 on_client_read_body(struct http_conn *conn, struct evbuffer *buf, void *arg)
 {
 	struct client *client = arg;
-	
-	if (!http_conn_write_buf(client->server->conn, buf))
+
+	if (client->state == CLIENT_STATE_DISCARD_INPUT)
+		evbuffer_drain(buf, -1);
+	else if (!http_conn_write_buf(client->server->conn, buf))
 		http_conn_stop_reading(conn);
 }
 
@@ -480,10 +540,13 @@ on_client_msg_complete(struct http_conn *conn, void *arg)
 {
 	struct client *client = arg;
 
-	if (http_conn_current_message_has_body(conn)) {
-		log_debug("proxy: finished reading client's message");
+	log_debug("proxy: finished reading client's message");
+
+	if (client->state == CLIENT_STATE_DISCARD_INPUT)
+		client_close_on_flush(client);
+	else if (http_conn_current_message_has_body(conn))
 		http_conn_write_finished(client->server->conn);
-	}
+
 }
 
 static void
@@ -499,7 +562,6 @@ on_client_flush(struct http_conn *conn, void *arg)
 {
 	struct client *client = arg;
 
-	// XXX perhaps delay before closing?
 	if (client->state == CLIENT_STATE_CLOSING)
 		client_free(client);
 }
@@ -543,7 +605,7 @@ on_server_error(struct http_conn *conn, enum http_conn_error err, void *arg)
 	case SERVER_STATE_IDLE:
 		assert(server->client == NULL);
 		TAILQ_REMOVE(&idle_servers, server, next);
-		log_debug("proxy: idle server %p, %s:%d timedout",
+		log_debug("proxy: idle server connection %p, %s:%d closed",
 			  server, server->host, server->port);
 		break;
 	default:
@@ -568,14 +630,14 @@ on_server_response(struct http_conn *conn, struct http_response *resp,
 {
 	struct server *server = arg;
 
+	// XXX we should probably disable persistence on the server's
+	// connection if it sends an error response while we're sending
+ 	// client POST/PUT
 	client_write_response(server->client, resp);
 
 	if (http_conn_current_message_has_body(conn))
 		log_debug("proxy: will copy body from server %p to client %p",
 			  server, server->client);
-
-
-	// XXX maybe stop reading body on error?
 
 	http_response_free(resp);
 }

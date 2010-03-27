@@ -1,6 +1,7 @@
 
 #include <sys/queue.h>
 #include <assert.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -10,6 +11,7 @@
 #include <event2/buffer.h>
 
 #include "httpconn.h"
+#include "conn.h"
 #include "headers.h"
 #include "util.h"
 #include "log.h"
@@ -45,6 +47,8 @@ struct http_conn {
 	int msg_complete_on_eof;
 	int persistent;
 	int expect_continue;
+	int will_flush;
+	int will_free;
 	const struct http_cbs *cbs;
 	void *cbarg;
 	ev_int64_t body_length;
@@ -139,66 +143,6 @@ http_version_to_string(enum http_version v)
 	return "???";
 }
 
-static const char *
-error_code_to_reason_string(int code)
-{
-	switch (code) {
-	case 400:
-		return "Bad Request";
-	case 401:
-		return "Unauthorized";
-	case 403:
-		return "Forbidden";
-	case 404:
-		return "Not Found";
-	case 405:
-		return "Method Not Allowed";
-	case 406:
-		return "Not Acceptable";
-	case 407:
-		return "Proxy Authentication Required";
-	case 408:
-		return "Request Timeout";
-	case 409:
-		return "Conflict";
-	case 410:
-		return "Gone";
-	case 411:
-		return "Length Required";
-	case 412:
-		return "Precondition Failed";
-	case 413:
-		return "Request Entity Too Large";
-	case 414:
-		return "Request-URI Too Long";
-	case 415:
-		return "Unsupported Media Type";
-	case 416:
-		return "Requested Range Not Satisfiable";
-	case 417:
-		return "Expectation Failed";
-	case 421:
-		return "There are too many connections from your internet "
-		       "address";
-	case 500:
-		return "Internal Server Error";
-	case 501:
-		return "Not Implemented";
-	case 502:
-		return "Bad Gateway";
-	case 503:
-		return "Service Unavailable";
-	case 504:
-		return "Gateway Timeout";
-	case 505:
-		return "HTTP Version Not Supported";
-	case 530:
-		return "User access denied";
-	}
-
-	return "???";
-}
-
 const char *
 http_conn_error_to_string(enum http_conn_error err)
 {
@@ -218,7 +162,7 @@ http_conn_error_to_string(enum http_conn_error err)
 	case ERROR_INCOMPLETE_BODY:
 		return "Connection terminated prematurely while reading body";
 	case ERROR_HEADER_PARSE_FAILED:
-		return "Invalid headers";
+		return "Invalid client request";
 	case ERROR_CHUNK_PARSE_FAILED:
 		return "Invalid chunked data";
 	case ERROR_WRITE_FAILED:
@@ -718,26 +662,6 @@ tunnel_errorcb(struct bufferevent *bev, short what, void *_conn)
 	struct evbuffer *buf;
 
 	switch (conn->state) {
-	case HTTP_STATE_TUNNEL_CONNECTING:
-		assert(bev == conn->tunnel_bev);
-		if (what & BEV_EVENT_CONNECTED) {
-			conn->state = HTTP_STATE_TUNNEL_OPEN;
-			bufferevent_setcb(conn->bev, tunnel_readcb,
-				          tunnel_writecb, tunnel_errorcb, conn);
-			bufferevent_enable(conn->bev, EV_READ);
-			bufferevent_enable(conn->tunnel_bev, EV_READ);
-			conn->read_paused = 0;
-			conn->tunnel_read_paused = 0;
-			tunnel_transfer_data(conn, conn->tunnel_bev, conn->bev);
-			evbuffer_add_printf(bufferevent_get_output(conn->bev),
-					"%s 200 Connection established\r\n\r\n",
-					http_version_to_string(conn->vers));
-		} else {
-			bufferevent_setcb(conn->tunnel_bev, NULL, NULL,
-					  NULL, NULL);
-			EVENT1(conn, on_error, ERROR_TUNNEL_CONNECT_FAILED);
-		}
-		break;
 	case HTTP_STATE_TUNNEL_OPEN:
 		if (bev == conn->bev) {
 			log_debug("tunnel: client closed conn...");
@@ -769,21 +693,36 @@ tunnel_errorcb(struct bufferevent *bev, short what, void *_conn)
 }
 
 static void
+tunnel_connectcb(struct bufferevent *bev, int ok, void *_conn)
+{
+	struct http_conn *conn = _conn;
+
+	assert(conn->state == HTTP_STATE_TUNNEL_CONNECTING);
+
+	if (ok) {
+		conn->state = HTTP_STATE_TUNNEL_OPEN;
+		bufferevent_setcb(conn->tunnel_bev, tunnel_readcb,
+				  tunnel_writecb, tunnel_errorcb, conn);
+		bufferevent_enable(conn->bev, EV_READ);
+		bufferevent_enable(conn->tunnel_bev, EV_READ);
+		conn->read_paused = 0;
+		conn->tunnel_read_paused = 0;
+		tunnel_transfer_data(conn, conn->tunnel_bev, conn->bev);
+		evbuffer_add_printf(bufferevent_get_output(conn->bev),
+				"%s 200 Connection established\r\n\r\n",
+				http_version_to_string(conn->vers));
+	} else {
+		bufferevent_setcb(conn->tunnel_bev, NULL, NULL,
+				  NULL, NULL);
+		EVENT1(conn, on_error, ERROR_TUNNEL_CONNECT_FAILED);
+	}
+}
+
+static void
 http_errorcb(struct bufferevent *bev, short what, void *_conn)
 {
 	enum http_state state;
 	struct http_conn *conn = _conn;
-
-	if (conn->state == HTTP_STATE_CONNECTING) {
-		if (what & BEV_EVENT_CONNECTED) {
-			begin_message(conn);
-			EVENT0(conn, on_connect);
-		} else {	
-			conn->state = HTTP_STATE_MANGLED;
-			EVENT1(conn, on_error, ERROR_CONNECT_FAILED);
-		}
-		return;
-	}
 
 	assert(!(what & BEV_EVENT_CONNECTED));
 
@@ -872,9 +811,30 @@ http_writecb(struct bufferevent *bev, void *_conn)
 		bufferevent_setwatermark(bev, EV_WRITE, 0, 0);
 		conn->choked = 0;
 		EVENT0(conn, on_write_more);
-	} else if (evbuffer_get_length(outbuf) == 0)
-		EVENT0(conn, on_flush);
+	} else if (evbuffer_get_length(outbuf) == 0) {
+		if (!conn->will_flush)
+			EVENT0(conn, on_flush);
+	}
 }
+
+static void
+http_connectcb(struct bufferevent *bev, int ok, void *_conn)
+{
+	struct http_conn *conn = _conn;
+
+	assert(conn->state == HTTP_STATE_CONNECTING);
+	bufferevent_setcb(conn->bev, http_readcb, http_writecb,
+			  http_errorcb, conn);
+
+	if (ok) {
+		begin_message(conn);
+		EVENT0(conn, on_connect);
+	} else {	
+		conn->state = HTTP_STATE_MANGLED;
+		EVENT1(conn, on_error, ERROR_CONNECT_FAILED);
+	}
+}
+
 
 struct http_conn *
 http_conn_new(struct event_base *base, evutil_socket_t sock,
@@ -896,8 +856,9 @@ http_conn_new(struct event_base *base, evutil_socket_t sock,
 	if (!conn->inbuf_processed)
 		log_fatal("http_conn: failed to create evbuffer");
 
-	bufferevent_setcb(conn->bev, http_readcb, http_writecb,
-		          http_errorcb, conn);
+	if (type != HTTP_SERVER)
+		bufferevent_setcb(conn->bev, http_readcb, http_writecb,
+				  http_errorcb, conn);
 	
 	if (sock >= 0)
 		begin_message(conn);
@@ -909,10 +870,10 @@ int
 http_conn_connect(struct http_conn *conn, struct evdns_base *dns,
 		      int family, const char *host, int port)
 {
-	// XXX need SOCKS
+	assert(conn->type == HTTP_SERVER);
 	conn->state = HTTP_STATE_CONNECTING;
-	return bufferevent_socket_connect_hostname(conn->bev, dns, family,
-					    	   host, port);	
+	return conn_connect_bufferevent(conn->bev, dns, family, host, port,
+				        http_connectcb, conn);
 }
 
 static void
@@ -929,6 +890,10 @@ deferred_free(evutil_socket_t s, short what, void *arg)
 void
 http_conn_free(struct http_conn *conn)
 {
+	if (conn->will_free)
+		return;
+
+	conn->will_free = 1;
 	http_conn_stop_reading(conn);
 	bufferevent_disable(conn->bev, EV_WRITE);
 	bufferevent_setcb(conn->bev, NULL, NULL, NULL, NULL);
@@ -987,10 +952,12 @@ http_conn_write_response(struct http_conn *conn, struct http_response *resp)
 	headers_remove(resp->headers, "transfer-encoding");
 	resp->vers = conn->vers;
 
-	if (conn->vers == HTTP_10) {
-		conn->output_te = TE_IDENTITY;
+	if (conn->vers == HTTP_10 || !conn->persistent) {
+		if (conn->vers == HTTP_10)
+			conn->output_te = TE_IDENTITY;
 		headers_add_key_val(resp->headers, "Connection", "close");
-	} else if (conn->output_te == TE_CHUNKED) {
+	} 
+	if (conn->output_te == TE_CHUNKED) {
 		headers_add_key_val(resp->headers,
 			            "Transfer-Encoding", "chunked");
 	}
@@ -1077,6 +1044,12 @@ http_conn_is_persistent(struct http_conn *conn)
 }
 
 void
+http_conn_disable_persistence(struct http_conn *conn)
+{
+	conn->persistent = 0;
+}
+
+void
 http_conn_stop_reading(struct http_conn *conn)
 {
 	bufferevent_disable(conn->bev, EV_READ);
@@ -1095,23 +1068,35 @@ http_conn_start_reading(struct http_conn *conn)
 		process_inbuf(conn);
 }
 
+static void
+deferred_flush(evutil_socket_t fd, short what, void *_conn)
+{
+	struct http_conn *conn = _conn;
+	struct evbuffer *outbuf = bufferevent_get_output(conn->bev);
+
+	if (evbuffer_get_length(outbuf) == 0) {
+		conn->will_flush = 0;
+		EVENT0(conn, on_flush);
+	}
+}
+
 void
 http_conn_flush(struct http_conn *conn)
 {
-	struct evbuffer *outbuf = bufferevent_get_output(conn->bev);
-
-	// XXX this might cause recursion
-	if (evbuffer_get_length(outbuf) == 0)
-		EVENT0(conn, on_flush);
+	assert(!conn->will_free);
+	conn->will_flush = 1;
+	event_base_once(conn->base, -1, EV_TIMEOUT, deferred_flush, conn, NULL);
 }
 
 void
 http_conn_send_error(struct http_conn *conn, int code, const char *fmt, ...)
 {
 	char length[64];
+	char reason[256];
 	struct evbuffer *msg;
 	struct http_response resp;
 	struct header_list headers;
+	va_list ap;
 
 	assert(conn->type == HTTP_CLIENT);
 
@@ -1119,12 +1104,19 @@ http_conn_send_error(struct http_conn *conn, int code, const char *fmt, ...)
 	msg = evbuffer_new();
 	resp.headers = &headers;
 
+	if (conn->vers == HTTP_UNKNOWN)
+		conn->vers = HTTP_11;
+
+	
+	va_start(ap, fmt);
+	evutil_vsnprintf(reason, sizeof(reason), fmt, ap);
+	va_end(ap);
+
 	conn->output_te = TE_IDENTITY;
 	resp.vers = HTTP_11;
 	resp.code = code;
-	resp.reason = (char*)error_code_to_reason_string(code);
+	resp.reason = reason;
 
-	// XXX do something with fmt. make it html friendly
 	evbuffer_add_printf(msg,
 		"<html>\n"
 		"<head>\n"
@@ -1160,14 +1152,13 @@ http_conn_start_tunnel(struct http_conn *conn, struct evdns_base *dns,
 	http_conn_stop_reading(conn);
 	conn->tunnel_bev = bufferevent_socket_new(conn->base, -1,
 						  BEV_OPT_CLOSE_ON_FREE);
-	bufferevent_setcb(conn->tunnel_bev, tunnel_readcb,
+	bufferevent_setcb(conn->bev, tunnel_readcb,
 			  tunnel_writecb, tunnel_errorcb, conn);
 	log_info("tunnel: attempting connection to %s:%d",
 		 log_scrub(host), port);
-	// XXX need SOCKS
 	conn->state = HTTP_STATE_TUNNEL_CONNECTING;
-	return bufferevent_socket_connect_hostname(conn->tunnel_bev, dns,
-						   family, host, port);
+	return conn_connect_bufferevent(conn->tunnel_bev, dns, family,
+				host, port, tunnel_connectcb, conn);
 }
 
 void
