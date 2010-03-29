@@ -203,9 +203,9 @@ conn_connect_bufferevent(struct bufferevent *bev, struct evdns_base *dns,
 			hint.ai_protocol = IPPROTO_TCP;
 			hint.ai_socktype = SOCK_STREAM;
 
-			rv = evdns_getaddrinfo(dns, name, portstr, &hint,
+			evdns_getaddrinfo(dns, name, portstr, &hint,
 				          socks_resolvecb, info);
-			return rv;
+			return 0;
 		}
 #endif
 	}

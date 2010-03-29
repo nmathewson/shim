@@ -1,0 +1,81 @@
+
+shim -- wedge this HTTP proxy between your browser and Tor 
+
+Dependencies
+-------------
+
+You'll need Libevent 2 or greater!
+
+
+How to Build and Install
+-------------------------
+
+1. Install Libevent 2 somewhere if it hasn't been already.
+2. ./configure
+3. make
+4. make install
+
+Notes: 
+* If you installed Libevent somewhere non-standard, you might need to export
+PKG_CONFIG_PATH or LIBEVENT_CFLAGS and LIBEVENT_LIBS environment variables, and
+then run ./configure again.
+
+* If you're concerned about the proxy making direct connections (including
+connections to HTTP servers and DNS servers), you can add the
+--disable-direct-connections switch to configure. This will force you to
+run shim with a SOCKS 4a server, returning an error message if one isn't
+configured.
+
+* If you're trying to debug a problem, and you're using GNU GCC, GDB etc,
+you can:
+
+	make clean
+	make CFLAGS='-g -Wall'
+
+... to prevent optimization that might interfere with your GDB sessions.
+
+
+Command Line Arguments
+-----------------------
+
+shim [-l host] [-p port] [-qVv] [socks proxy]
+
+-l
+	The address to listen on, or "any" to listen on all available
+	interfaces. The default listen address is 127.0.0.1
+
+-p
+	The port to listen on. Default is 8123.
+
+-q
+	Decrease verbosity. You can specify this option more than once.
+
+-v
+	Increase verbosity. You can specify this option more than once.
+
+-V
+	Print the version and exit.
+
+socks proxy
+	This is an optional argument specifying the SOCKS server to make
+	connections through. SOCKS proxies are specified like this:
+
+		socks_version://address[:port]
+
+	Recognized SOCKS versions are socks4 and socks4a. With socks4, all
+	host names are resolved through your name server, while with socks4a,
+	host names are passed to your SOCKS server. The port is optional. By
+	default it is set to 1080.
+
+	To use shim with a typically-configured Tor:
+
+		socks4a://127.0.0.1:9050
+
+	If you built shim with --disable-direct-connections, you'll want
+	socks4a!
+
+
+Where to Report Bugs
+-------------------
+
+Christopher Davis <chrisd@torproject.org>

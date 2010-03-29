@@ -1,0 +1,6 @@
+- Add unit tests
+- Add code to daemonize
+- Expand autoconf coverage
+- Doxygenify code
+- Handle range requests better?
+- Fix bugs

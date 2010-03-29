@@ -262,7 +262,7 @@ url_free(struct url *url)
 const char *
 format_addr(const struct sockaddr *addr)
 {
-	const char *r;
+	const char *r = NULL;
 	static char buf[256];
 	char tmp[256];
 

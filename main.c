@@ -4,8 +4,10 @@
 #include <stdlib.h>
 // XXX unistd/getopt isnt available everywhere!
 #include <unistd.h>
-// XXX only needed for disabling SIGPIPE on unix
+
+#ifndef WIN32
 #include <signal.h>
+#endif
 
 #include <event2/event.h>
 #include <event2/dns.h>
@@ -144,7 +146,8 @@ init_socket_stuff()
 static void
 usage(void)
 {
-	printf("shim [-l host] [-p port] [-qVv] [socks proxy]\n");
+	printf("shim [-l host] [-p port] [-qVv] "
+	       "[ socks_version://address[:port] ]\n");
 	exit(1);
 }
 
