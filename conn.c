@@ -1,4 +1,5 @@
-#include <netinet/in.h>
+#include "netheaders.h"
+
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
