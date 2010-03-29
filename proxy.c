@@ -5,6 +5,7 @@
 #include <event2/listener.h>
 #include <event2/buffer.h>
 #include "proxy.h"
+#include "conn.h"
 #include "httpconn.h"
 #include "util.h"
 #include "headers.h"
@@ -424,7 +425,7 @@ client_request_serviced(struct client *client)
 }
 
 static void
-client_notice_server_failed(struct client *client)
+client_notice_server_failed(struct client *client, const char *msg)
 {
 	struct http_request *req;
 	struct server *server = client->server;
@@ -435,9 +436,7 @@ client_notice_server_failed(struct client *client)
 		if (evutil_ascii_strcasecmp(req->url->host, server->host) ||
 		    req->url->port != server->port)
 			break;
-		// XXX set a more descriptive error message
-		http_conn_send_error(client->conn, 502,
-				     "Server connection failed");
+		http_conn_send_error(client->conn, 502, "%s", msg);
 		client_request_serviced(client);
 	}
 }
@@ -582,6 +581,7 @@ static void
 on_server_error(struct http_conn *conn, enum http_conn_error err, void *arg)
 {
 	struct server *server = arg;
+	const char *msg;
 
 	switch (server->state) {
 	case SERVER_STATE_CONNECTING:
@@ -591,16 +591,17 @@ on_server_error(struct http_conn *conn, enum http_conn_error err, void *arg)
 		//     we should try resending the first request
 		if (err == ERROR_CONNECT_FAILED) {
 			assert(server->state == SERVER_STATE_CONNECTING);
-			log_socket_error("proxy: connection to %s:%d failed",
-					 log_scrub(server->host), server->port);
+			msg = conn_get_connect_error();
+			log_error("proxy: connection to %s:%d failed: %s",
+				  log_scrub(server->host), server->port, msg);
 		} else {
+			msg = http_conn_error_to_string(err);
 			log_error("proxy: error while communicating with "
 				  "%s:%d: %s", log_scrub(server->host),
-				  server->port,
-				  http_conn_error_to_string(err));
+				  server->port, msg);
 		}
 		assert(server->client != NULL);
-		client_notice_server_failed(server->client);
+		client_notice_server_failed(server->client, msg);
 		break;
 	case SERVER_STATE_IDLE:
 		assert(server->client == NULL);
@@ -720,6 +721,8 @@ proxy_init(struct event_base *base, struct evdns_base *dns,
 				 format_addr(listen_here));
 		return -1;
 	}
+
+	log_notice("proxy: listening on %s", format_addr(listen_here));
 	
 	listener = lcs;
 	proxy_event_base = base;

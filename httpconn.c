@@ -1123,10 +1123,10 @@ http_conn_send_error(struct http_conn *conn, int code, const char *fmt, ...)
 		"<title>%d %s</title>\n"
 		"</head>\n"
 		"<body>\n"
-		"<h1>%d %s</h1>\n"
+		"<h1>%s</h1>\n"
 		"</body>\n"
 		"</html>\n",
-		code, resp.reason, code, resp.reason);
+		code, resp.reason, resp.reason);
 
 	evutil_snprintf(length, sizeof(length), "%u", 
 		        (unsigned)evbuffer_get_length(msg));
