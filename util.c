@@ -186,6 +186,13 @@ url_tokenize(const char *str)
 
 	ntokens = tokenize(str, "/", 3, &tokens);
 
+	/* just a path? */
+	if (ntokens >= 1 && TAILQ_FIRST(&tokens)->token[0] == '\0') {
+		url = mem_calloc(1, sizeof(*url));
+		url->path = mem_strdup(str);
+		goto out;
+	}
+
 	if (ntokens < 3)
 		goto out;
 
@@ -222,7 +229,7 @@ url_tokenize(const char *str)
 		pathstr[0] = '/';
 		memcpy(pathstr + 1, path->token, len);
 	} else
-		pathstr = strdup("/");
+		pathstr = mem_strdup("/");
 	
 
 	url = mem_calloc(1, sizeof(*url));
