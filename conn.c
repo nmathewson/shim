@@ -9,6 +9,7 @@
 #include <event2/util.h>
 #include <event2/dns.h>
 
+#include "config.h"
 #include "conn.h"
 #include "util.h"
 #include "log.h"
@@ -189,7 +190,10 @@ conn_connect_bufferevent(struct bufferevent *bev, struct evdns_base *dns,
 			rv = bufferevent_socket_connect(bev,
 					(struct sockaddr*)&socks_addr,
 					socks_addr_len);
-		} else {
+			return rv;
+		}
+#ifndef DISABLE_DIRECT_CONNECTIONS
+		else {
 			struct evutil_addrinfo hint;
 			char portstr[NI_MAXSERV];
 
@@ -199,17 +203,16 @@ conn_connect_bufferevent(struct bufferevent *bev, struct evdns_base *dns,
 			hint.ai_protocol = IPPROTO_TCP;
 			hint.ai_socktype = SOCK_STREAM;
 
-			evdns_getaddrinfo(dns, name, portstr, &hint,
+			rv = evdns_getaddrinfo(dns, name, portstr, &hint,
 				          socks_resolvecb, info);
-			rv = 0;
+			return rv;
 		}
-
-		return rv;
+#endif
 	}
 #ifdef DISABLE_DIRECT_CONNECTIONS
 	{
 		const char *msg;
-		msg = "Direct connections disabled, but I have no SOCKS "
+		msg = "Direct connections disabled, but I have no SOCKS 4a "
 		      "proxy to connect to!";
 		log_error("conn: %s", msg);
 		finish_connection(info, 0, msg);

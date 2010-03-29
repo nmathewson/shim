@@ -1,4 +1,4 @@
-AC_INIT([shim], [0.1])
+AC_INIT([shim], [0.1.0])
 AM_INIT_AUTOMAKE
 AC_CONFIG_SRCDIR([main.c])
 
@@ -6,14 +6,26 @@ AC_CONFIG_HEADER(config.h)
 
 AC_PROG_CC
 AC_PROG_INSTALL
-
 AC_PROG_GCC_TRADITIONAL
+AC_HEADER_STDC
+
 if test "$GCC" = yes; then
-	CFLAGS="$CFLAGS -g -Wall"
+	CFLAGS="$CFLAGS -Wall"
 fi
+
+AC_ARG_ENABLE(direct-connections,
+	AS_HELP_STRING(--disable-direct-connections,
+		       only make connections through a SOCKS proxy),
+	[],
+	[enable_direct_connections=yes])
 
 PKG_CHECK_MODULES(LIBEVENT, libevent >= 2.0.0)
 AC_SUBST(LIBEVENT_CFLAGS)
 AC_SUBST(LIBEVENT_LIBS)
+
+if test x$enable_direct_connections = xno; then
+	AC_DEFINE(DISABLE_DIRECT_CONNECTIONS, 1,
+	  [Define if shim should only allow connections through a SOCKS proxy])
+fi
 
 AC_OUTPUT(Makefile)
