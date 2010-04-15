@@ -788,6 +788,9 @@ process_inbuf(struct http_conn *conn)
 	struct evbuffer *inbuf = bufferevent_get_input(conn->bev);
 	enum http_state state_before;
 
+	if (evbuffer_get_length(inbuf) == 0)
+		return;
+
 	do {
 		state_before = conn->state;
 		process_one_step(conn);
@@ -934,6 +937,7 @@ http_conn_write_continue(struct http_conn *conn)
 	struct evbuffer *outbuf;
 
 	if (conn->expect_continue) {
+		log_debug("httpconn: writing continue status");
 		outbuf = bufferevent_get_output(conn->bev);
 		conn->expect_continue = 0;
 		assert(conn->vers == HTTP_11);
@@ -1057,6 +1061,12 @@ http_conn_stop_reading(struct http_conn *conn)
 	conn->read_paused = 1;
 }
 
+static void
+deferred_process_inbuf(evutil_socket_t s, short what, void *_conn)
+{
+	process_inbuf(_conn);
+}
+
 void
 http_conn_start_reading(struct http_conn *conn)
 {
@@ -1064,9 +1074,9 @@ http_conn_start_reading(struct http_conn *conn)
 
 	bufferevent_enable(conn->bev, EV_READ);
 	conn->read_paused = 0;
-	// XXX this might cause recursion
 	if (evbuffer_get_length(inbuf) > 0)
-		process_inbuf(conn);
+		event_base_once(conn->base, -1, EV_TIMEOUT,
+				deferred_process_inbuf, conn, NULL);
 }
 
 static void
