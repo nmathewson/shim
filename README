@@ -11,9 +11,10 @@ How to Build and Install
 -------------------------
 
 1. Install Libevent 2 somewhere if it hasn't been already.
-2. ./configure
-3. make
-4. make install
+2. ./autogen.sh
+3. ./configure
+4. make
+5. make install
 
 Notes: 
 * If you installed Libevent somewhere non-standard, you might need to export
